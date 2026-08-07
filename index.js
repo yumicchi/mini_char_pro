@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.4.0';
+const EXTENSION_VERSION = '1.5.0';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const LAUNCHER_RETRY_LIMIT = 20;
@@ -741,6 +741,16 @@ function annotateClonedInteractionPaths(sourceRoot, cloneRoot) {
             + '[class*="decision" i], [class*="select" i], [class*="card" i]',
         )) {
             clone.setAttribute('data-pip-source-interactive', 'true');
+        }
+        const sourceText = String(source.textContent || '').replace(/\s+/g, ' ').trim();
+        if (
+            source.matches?.(
+                '[data-option], [data-pip-input], .option-item, '
+                + '[class*="option" i], [class*="choice" i], [class*="decision" i]',
+            )
+            || /^[A-E]\s*.{3,}$/i.test(sourceText)
+        ) {
+            clone.setAttribute('data-pip-source-option', 'true');
         }
     }
 }
