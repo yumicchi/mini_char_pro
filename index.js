@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.3.1';
+const EXTENSION_VERSION = '1.3.2';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const LAUNCHER_RETRY_LIMIT = 20;
@@ -691,6 +691,56 @@ function absolutizeClonedResources(sourceRoot, cloneRoot) {
     }
 }
 
+function getElementChildPath(element, root) {
+    if (element === root) {
+        return '';
+    }
+
+    const indices = [];
+    let current = element;
+    while (current && current !== root) {
+        const parent = current.parentElement;
+        if (!parent) {
+            return null;
+        }
+
+        const index = Array.prototype.indexOf.call(parent.children, current);
+        if (index < 0) {
+            return null;
+        }
+        indices.push(index);
+        current = parent;
+    }
+
+    return current === root ? indices.reverse().join('.') : null;
+}
+
+function annotateClonedInteractionPaths(sourceRoot, cloneRoot) {
+    const sourceElements = [sourceRoot, ...(sourceRoot.querySelectorAll?.('*') ?? [])];
+    const cloneElements = [cloneRoot, ...(cloneRoot.querySelectorAll?.('*') ?? [])];
+
+    for (let index = 0; index < sourceElements.length; index += 1) {
+        const source = sourceElements[index];
+        const clone = cloneElements[index];
+        if (!clone || ['SCRIPT', 'STYLE', 'LINK', 'META', 'BASE'].includes(source.tagName)) {
+            continue;
+        }
+
+        const path = getElementChildPath(source, sourceRoot);
+        if (path !== null) {
+            clone.setAttribute('data-pip-source-path', path);
+        }
+        if (source.matches?.(
+            '[data-veil-action], [data-pip-input], [data-option], .option-item, '
+            + '[role="button"], [onclick], [tabindex], button, a, '
+            + '[class*="option" i], [class*="choice" i], [class*="action" i], '
+            + '[class*="decision" i], [class*="select" i], [class*="card" i]',
+        )) {
+            clone.setAttribute('data-pip-source-interactive', 'true');
+        }
+    }
+}
+
 function copyFrameRootAppearance(frameDocument, wrapper) {
     try {
         const styles = frameDocument.defaultView?.getComputedStyle?.(frameDocument.body);
@@ -755,6 +805,7 @@ function serializeFrameDocument(frame, diagnostics = null) {
     const wrapper = document.createElement('section');
     wrapper.className = 'pip-mini-chat-embedded-document';
     wrapper.dataset.pipEmbeddedDocument = 'true';
+    wrapper.dataset.pipSourceFrameId = String(frame.id || frame.name || '');
     copyFrameRootAppearance(frameDocument, wrapper);
 
     for (const source of frameDocument.head?.querySelectorAll?.(
@@ -767,7 +818,7 @@ function serializeFrameDocument(frame, diagnostics = null) {
         wrapper.append(clone);
     }
 
-    const bodyClone = cloneRenderedNode(frameDocument.body, diagnostics);
+    const bodyClone = cloneRenderedNode(frameDocument.body, diagnostics, true);
     while (bodyClone.firstChild) {
         wrapper.append(bodyClone.firstChild);
     }
@@ -779,9 +830,12 @@ function serializeFrameDocument(frame, diagnostics = null) {
     return wrapper;
 }
 
-function cloneRenderedNode(sourceNode, diagnostics = null) {
+function cloneRenderedNode(sourceNode, diagnostics = null, annotateInteractions = false) {
     const clone = sourceNode.cloneNode(true);
     absolutizeClonedResources(sourceNode, clone);
+    if (annotateInteractions) {
+        annotateClonedInteractionPaths(sourceNode, clone);
+    }
     const sourceFrames = [...(sourceNode.querySelectorAll?.('iframe') ?? [])];
     const cloneFrames = [...(clone.querySelectorAll?.('iframe') ?? [])];
 
@@ -1003,6 +1057,50 @@ function collectRenderedInteractionRoots(root) {
     return roots;
 }
 
+function collectAccessibleInteractionFrames(root) {
+    const results = [];
+    const visited = new WeakSet();
+
+    function visit(container) {
+        for (const frame of container.querySelectorAll?.('iframe') ?? []) {
+            if (visited.has(frame)) {
+                continue;
+            }
+            visited.add(frame);
+
+            const frameDocument = getAccessibleFrameDocument(frame);
+            if (!frameDocument?.body) {
+                continue;
+            }
+
+            results.push({ frame, document: frameDocument });
+            visit(frameDocument.body);
+        }
+    }
+
+    visit(root);
+    return results;
+}
+
+function resolveElementChildPath(root, value) {
+    const path = String(value ?? '');
+    if (!path) {
+        return root;
+    }
+    if (!/^\d+(?:\.\d+)*$/.test(path)) {
+        return null;
+    }
+
+    let current = root;
+    for (const part of path.split('.')) {
+        current = current?.children?.[Number(part)] ?? null;
+        if (!current) {
+            return null;
+        }
+    }
+    return current;
+}
+
 function findDesktopInteractionTarget(payload = {}) {
     const context = getContext();
     const latest = findLatestAssistantMessage(context?.chat);
@@ -1017,6 +1115,23 @@ function findDesktopInteractionTarget(payload = {}) {
     }
 
     const roots = collectRenderedInteractionRoots(root);
+
+    if (
+        payload.sourceFrameId
+        && typeof payload.sourcePath === 'string'
+    ) {
+        const expectedFrameId = String(payload.sourceFrameId);
+        for (const entry of collectAccessibleInteractionFrames(root)) {
+            if (String(entry.frame.id || entry.frame.name || '') !== expectedFrameId) {
+                continue;
+            }
+
+            const exact = resolveElementChildPath(entry.document.body, payload.sourcePath);
+            if (exact) {
+                return exact;
+            }
+        }
+    }
 
     if (payload.id) {
         for (const interactionRoot of roots) {
@@ -1034,7 +1149,10 @@ function findDesktopInteractionTarget(payload = {}) {
     const expectedAction = normalizeInteractionText(payload.action);
     for (const interactionRoot of roots) {
         const candidates = interactionRoot.querySelectorAll(
-            '[data-veil-action], [data-pip-input], [data-option], .option-item, button',
+            '[data-veil-action], [data-pip-input], [data-option], .option-item, '
+            + '[role="button"], [onclick], [tabindex], button, a, '
+            + '[class*="option" i], [class*="choice" i], [class*="action" i], '
+            + '[class*="decision" i], [class*="select" i], [class*="card" i]',
         );
 
         for (const candidate of candidates) {
@@ -1063,7 +1181,16 @@ function findDesktopInteractionTarget(payload = {}) {
 function handleDesktopInteraction(payload = {}) {
     const target = findDesktopInteractionTarget(payload);
     if (target) {
-        target.click();
+        if (typeof target.click === 'function') {
+            target.click();
+        } else {
+            const EventConstructor = target.ownerDocument?.defaultView?.MouseEvent ?? MouseEvent;
+            target.dispatchEvent(new EventConstructor('click', {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+            }));
+        }
         return true;
     }
 
