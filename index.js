@@ -39,7 +39,6 @@ const DEFAULT_APPEARANCE_SETTINGS = Object.freeze({
     fontSize: 14,
     textOpacity: 1,
     stealthMode: false,
-    stealthOpacity: 0.18,
 });
 
 let pipWindow = null;
@@ -88,14 +87,13 @@ function normalizeAppearanceSettings(value = {}) {
             ? value.useThemeBackground
             : DEFAULT_APPEARANCE_SETTINGS.useThemeBackground,
         backgroundColor,
-        backgroundOpacity: clampNumber(value.backgroundOpacity, 0.1, 1, DEFAULT_APPEARANCE_SETTINGS.backgroundOpacity),
+        backgroundOpacity: clampNumber(value.backgroundOpacity, 0, 1, DEFAULT_APPEARANCE_SETTINGS.backgroundOpacity),
         fontFamily,
         fontSize: clampNumber(value.fontSize, 10, 24, DEFAULT_APPEARANCE_SETTINGS.fontSize),
         textOpacity: clampNumber(value.textOpacity, 0.1, 1, DEFAULT_APPEARANCE_SETTINGS.textOpacity),
         stealthMode: typeof value.stealthMode === 'boolean'
             ? value.stealthMode
             : DEFAULT_APPEARANCE_SETTINGS.stealthMode,
-        stealthOpacity: clampNumber(value.stealthOpacity, 0.05, 0.6, DEFAULT_APPEARANCE_SETTINGS.stealthOpacity),
     };
 }
 
@@ -347,11 +345,32 @@ function getPipStyles() {
             transition: opacity 0.18s ease;
         }
         .pip-mini-chat[data-stealth-mode="true"] {
-            opacity: var(--pip-stealth-opacity, 0.18);
+            background: transparent;
+            opacity: 0;
         }
         .pip-mini-chat[data-stealth-mode="true"]:hover,
         .pip-mini-chat[data-stealth-mode="true"]:focus-within {
             opacity: 1;
+        }
+        .pip-mini-chat[data-stealth-mode="true"] .pip-mini-chat__header,
+        .pip-mini-chat[data-stealth-mode="true"] .pip-mini-chat__input,
+        .pip-mini-chat[data-stealth-mode="true"] .pip-mini-chat__actions,
+        .pip-mini-chat[data-stealth-mode="true"] .pip-mini-chat__button,
+        .pip-mini-chat[data-stealth-mode="true"] .pip-mini-chat__scrollbar,
+        .pip-mini-chat[data-stealth-mode="true"] .pip-mini-chat__scroll-thumb,
+        .pip-mini-chat[data-stealth-mode="true"] .pip-mini-chat__output,
+        .pip-mini-chat[data-stealth-mode="true"] .pip-mini-chat__output * {
+            border-color: transparent !important;
+            background-color: transparent !important;
+            background-image: none !important;
+            box-shadow: none !important;
+        }
+        .pip-mini-chat[data-transparent-background="true"] .pip-mini-chat__output,
+        .pip-mini-chat[data-transparent-background="true"] .pip-mini-chat__output * {
+            border-color: transparent !important;
+            background-color: transparent !important;
+            background-image: none !important;
+            box-shadow: none !important;
         }
         .pip-mini-chat[data-stealth-mode="true"]:not(:hover):not(:focus-within) {
             grid-template-rows: 0 minmax(0, 1fr) 0 0;
@@ -369,13 +388,17 @@ function getPipStyles() {
             justify-content: space-between;
             gap: 8px;
             padding: 10px 12px;
-            border-bottom: 1px solid var(--SmartThemeBorderColor, #303036);
-            background: color-mix(
+            border-bottom: 1px solid color-mix(
                 in srgb,
-                var(--pip-background-color, var(--SmartThemeBlurTintColor, #202024)) var(--pip-background-opacity-percent, 100%),
+                var(--SmartThemeBorderColor, #303036) var(--pip-background-opacity-percent, 100%),
                 transparent
             );
-            box-shadow: 0 1px 0 var(--SmartThemeBorderColor, #303036);
+            background: transparent;
+            box-shadow: 0 1px 0 color-mix(
+                in srgb,
+                var(--SmartThemeBorderColor, #303036) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
             transition: opacity 0.18s ease;
         }
         .pip-mini-chat__title {
@@ -429,7 +452,11 @@ function getPipStyles() {
             bottom: 6px;
             width: 14px;
             border-radius: 999px;
-            background: color-mix(in srgb, var(--SmartThemeBorderColor, #303036) 38%, transparent);
+            background: color-mix(
+                in srgb,
+                var(--SmartThemeBorderColor, #303036) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
             opacity: 0;
             pointer-events: none;
             transition: opacity 0.15s ease;
@@ -445,12 +472,20 @@ function getPipStyles() {
             width: 8px;
             min-height: 24px;
             border-radius: 999px;
-            background: color-mix(in srgb, var(--SmartThemeQuoteColor, #a1a1aa) 78%, var(--SmartThemeBodyColor, #f4f4f5) 22%);
+            background: color-mix(
+                in srgb,
+                var(--SmartThemeQuoteColor, #a1a1aa) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
             cursor: grab;
         }
         .pip-mini-chat__scroll-thumb:hover,
         .pip-mini-chat__scroll-thumb:active {
-            background: var(--SmartThemeBodyColor, #f4f4f5);
+            background: color-mix(
+                in srgb,
+                var(--SmartThemeBodyColor, #f4f4f5) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
         }
         .pip-mini-chat__scroll-thumb:active {
             cursor: grabbing;
@@ -479,7 +514,11 @@ function getPipStyles() {
             max-height: 76px;
             margin: 0 12px 10px;
             resize: none;
-            border: 1px solid var(--SmartThemeBorderColor, #3f3f46);
+            border: 1px solid color-mix(
+                in srgb,
+                var(--SmartThemeBorderColor, #3f3f46) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
             border-radius: 8px;
             padding: 7px 10px;
             background: color-mix(
@@ -494,7 +533,11 @@ function getPipStyles() {
             transition: opacity 0.18s ease;
         }
         .pip-mini-chat__input:focus {
-            border-color: var(--SmartThemeUnderlineColor, #22d3ee);
+            border-color: color-mix(
+                in srgb,
+                var(--SmartThemeUnderlineColor, #22d3ee) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
             outline: none;
         }
         .pip-mini-chat__actions {
@@ -507,9 +550,17 @@ function getPipStyles() {
         }
         .pip-mini-chat__button {
             min-height: 36px;
-            border: 1px solid var(--SmartThemeBorderColor, #3f3f46);
+            border: 1px solid color-mix(
+                in srgb,
+                var(--SmartThemeBorderColor, #3f3f46) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
             border-radius: 8px;
-            background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #27272a) 76%, var(--SmartThemeBodyColor, #fafafa) 24%);
+            background: color-mix(
+                in srgb,
+                var(--SmartThemeBlurTintColor, #27272a) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
             color: inherit;
             font: inherit;
             font-weight: 700;
@@ -523,16 +574,16 @@ function getPipStyles() {
             opacity: 0.5;
         }
         .pip-mini-chat__button--send {
-            border-color: var(--SmartThemeUnderlineColor, #0891b2);
-            background: color-mix(in srgb, var(--SmartThemeUnderlineColor, #0e7490) 45%, var(--SmartThemeBlurTintColor, #202024) 55%);
+            border-color: color-mix(in srgb, var(--SmartThemeUnderlineColor, #0891b2) var(--pip-background-opacity-percent, 100%), transparent);
+            background: color-mix(in srgb, var(--SmartThemeUnderlineColor, #0e7490) var(--pip-background-opacity-percent, 100%), transparent);
         }
         .pip-mini-chat__button--stop {
-            border-color: #b44;
-            background: color-mix(in srgb, #b44 38%, var(--SmartThemeBlurTintColor, #202024) 62%);
+            border-color: color-mix(in srgb, #b44 var(--pip-background-opacity-percent, 100%), transparent);
+            background: color-mix(in srgb, #b44 var(--pip-background-opacity-percent, 100%), transparent);
         }
         .pip-mini-chat__button--regenerate {
-            border-color: var(--SmartThemeQuoteColor, #52525b);
-            background: color-mix(in srgb, var(--SmartThemeQuoteColor, #3f3f46) 38%, var(--SmartThemeBlurTintColor, #202024) 62%);
+            border-color: color-mix(in srgb, var(--SmartThemeQuoteColor, #52525b) var(--pip-background-opacity-percent, 100%), transparent);
+            background: color-mix(in srgb, var(--SmartThemeQuoteColor, #3f3f46) var(--pip-background-opacity-percent, 100%), transparent);
         }
     `;
 }
@@ -653,8 +704,8 @@ function applyAppearanceSettings() {
     root.style.setProperty('--pip-text-opacity', String(appearanceSettings.textOpacity));
     root.style.setProperty('--pip-font-family', FONT_FAMILIES[appearanceSettings.fontFamily]);
     root.style.setProperty('--pip-font-size', `${appearanceSettings.fontSize}px`);
-    root.style.setProperty('--pip-stealth-opacity', String(appearanceSettings.stealthOpacity));
     root.dataset.stealthMode = String(appearanceSettings.stealthMode);
+    root.dataset.transparentBackground = String(appearanceSettings.backgroundOpacity === 0);
     pipWindow.document.title = appearanceSettings.stealthMode ? 'Window' : '隐蔽小窗';
 }
 
@@ -1254,7 +1305,6 @@ function syncAppearanceSettingsPanel(panel = document.getElementById('pip-mini-c
     const fontSize = panel.querySelector('#pip-mini-chat-font-size');
     const textOpacity = panel.querySelector('#pip-mini-chat-text-opacity');
     const stealthMode = panel.querySelector('#pip-mini-chat-stealth-mode');
-    const stealthOpacity = panel.querySelector('#pip-mini-chat-stealth-opacity');
 
     useThemeBackground.checked = appearanceSettings.useThemeBackground;
     backgroundColor.value = appearanceSettings.backgroundColor;
@@ -1267,9 +1317,6 @@ function syncAppearanceSettingsPanel(panel = document.getElementById('pip-mini-c
     textOpacity.value = String(Math.round(appearanceSettings.textOpacity * 100));
     panel.querySelector('[data-value-for="pip-mini-chat-text-opacity"]').textContent = asPercent(appearanceSettings.textOpacity);
     stealthMode.checked = appearanceSettings.stealthMode;
-    stealthOpacity.value = String(Math.round(appearanceSettings.stealthOpacity * 100));
-    stealthOpacity.disabled = !appearanceSettings.stealthMode;
-    panel.querySelector('[data-value-for="pip-mini-chat-stealth-opacity"]').textContent = asPercent(appearanceSettings.stealthOpacity);
 }
 
 function registerSettingsPanel() {
@@ -1307,8 +1354,11 @@ function registerSettingsPanel() {
                     <label class="pip-mini-chat-settings__slider" for="pip-mini-chat-background-opacity">
                         <span>背景不透明度</span>
                         <output data-value-for="pip-mini-chat-background-opacity">100%</output>
-                        <input id="pip-mini-chat-background-opacity" type="range" min="10" max="100" step="5">
+                        <input id="pip-mini-chat-background-opacity" type="range" min="0" max="100" step="5">
                     </label>
+                    <small class="pip-mini-chat-settings__hint">
+                        设为 0% 时，插件自身的背景、边框和按钮底色会完全透明，仅保留内容。
+                    </small>
 
                     <label class="pip-mini-chat-settings__field" for="pip-mini-chat-font-family">
                         <span>字体</span>
@@ -1342,13 +1392,11 @@ function registerSettingsPanel() {
                         <span>开启隐蔽模式</span>
                     </label>
                     <small class="pip-mini-chat-settings__hint">
-                        鼠标移出小窗后淡化内容并收起标题、输入框和按钮；移入小窗或聚焦输入框后恢复显示。
+                        鼠标移出小窗后插件内容完全不可见；移入后只恢复文字和控件，不恢复插件背景色块。
                     </small>
-                    <label class="pip-mini-chat-settings__slider" for="pip-mini-chat-stealth-opacity">
-                        <span>隐蔽时可见度</span>
-                        <output data-value-for="pip-mini-chat-stealth-opacity">18%</output>
-                        <input id="pip-mini-chat-stealth-opacity" type="range" min="5" max="60" step="1">
-                    </label>
+                    <small class="pip-mini-chat-settings__hint">
+                        浏览器顶部的来源栏和系统窗口底色属于 Chromium 安全界面，插件无法修改或使其透出后方桌面。
+                    </small>
                 </div>
 
                 <button id="pip-mini-chat-reset-appearance" type="button" class="menu_button pip-mini-chat-settings__reset">
@@ -1395,9 +1443,6 @@ function registerSettingsPanel() {
     });
     panel.querySelector('#pip-mini-chat-stealth-mode').addEventListener('change', event => {
         updateAppearanceSettings({ stealthMode: event.currentTarget.checked });
-    });
-    panel.querySelector('#pip-mini-chat-stealth-opacity').addEventListener('input', event => {
-        updateAppearanceSettings({ stealthOpacity: Number(event.currentTarget.value) / 100 });
     });
     panel.querySelector('#pip-mini-chat-reset-appearance').addEventListener('click', () => {
         appearanceSettings = { ...DEFAULT_APPEARANCE_SETTINGS };
