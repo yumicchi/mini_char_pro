@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.3.0';
+const EXTENSION_VERSION = '1.3.1';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const LAUNCHER_RETRY_LIMIT = 20;
@@ -957,7 +957,7 @@ function getDesktopRenderPayload() {
         chat: context?.chat,
         formatter: context?.messageFormatting,
     });
-    let text = rawText;
+    let text = extractDesktopFallbackText(rawText) || rawText;
 
     if (
         renderedSnapshot?.containsFrontendSource

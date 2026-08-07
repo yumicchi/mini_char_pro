@@ -11,6 +11,9 @@ const DESKTOP_ACTION_TYPES = new Set([
     'interaction:select',
 ]);
 
+export const MAX_DESKTOP_MESSAGE_BYTES = 14 * 1024 * 1024;
+const LEGACY_DESKTOP_MESSAGE_BYTES = 1_500_000;
+
 export const DESKTOP_BRIDGE_SETTINGS_KEY = 'pip-mini-chat-desktop-bridge-settings';
 
 export const DEFAULT_DESKTOP_BRIDGE_SETTINGS = Object.freeze({
@@ -106,6 +109,44 @@ export function getDesktopBridgeStatusText(status) {
     return labels[status?.state] || '未启用';
 }
 
+function getUtf8ByteLength(value) {
+    if (typeof TextEncoder === 'function') {
+        return new TextEncoder().encode(value).byteLength;
+    }
+
+    return new Blob([value]).size;
+}
+
+function encodeBridgeMessage(
+    type,
+    payload,
+    logger = console,
+    maximumBytes = LEGACY_DESKTOP_MESSAGE_BYTES,
+) {
+    let encoded = JSON.stringify({ type, payload });
+    if (getUtf8ByteLength(encoded) <= maximumBytes) {
+        return encoded;
+    }
+
+    if (type !== 'render:update') {
+        logger.warn?.('[pip-mini-chat] Desktop bridge message is too large and was skipped.');
+        return null;
+    }
+
+    encoded = JSON.stringify({
+        type,
+        payload: {
+            title: String(payload?.title || 'SillyTavern').slice(0, 200),
+            html: '',
+            text: String(payload?.text || '渲染界面过大，已切换为原始文字。').slice(0, 200_000),
+            streaming: Boolean(payload?.streaming),
+            themeVariables: {},
+        },
+    });
+    logger.warn?.('[pip-mini-chat] Render payload exceeded the local limit; text fallback was sent.');
+    return encoded;
+}
+
 export class DesktopBridge {
     constructor({
         settings,
@@ -129,6 +170,7 @@ export class DesktopBridge {
         this.reconnectTimer = null;
         this.syncTimer = null;
         this.lastRenderFingerprint = '';
+        this.remoteMaxPayloadBytes = LEGACY_DESKTOP_MESSAGE_BYTES;
         this.status = {
             state: 'disabled',
             detail: '',
@@ -164,6 +206,7 @@ export class DesktopBridge {
     connect() {
         this.disconnectSocket();
         this.clearReconnectTimer();
+        this.remoteMaxPayloadBytes = LEGACY_DESKTOP_MESSAGE_BYTES;
 
         if (!this.settings.enabled) {
             this.setStatus('disabled');
@@ -203,7 +246,6 @@ export class DesktopBridge {
                 plugin: '隐蔽小窗',
             });
             this.sendGenerationState();
-            this.sync(true);
         });
 
         socket.addEventListener('message', event => {
@@ -280,7 +322,16 @@ export class DesktopBridge {
         }
 
         try {
-            this.socket.send(JSON.stringify({ type, payload }));
+            const encoded = encodeBridgeMessage(
+                type,
+                payload,
+                this.logger,
+                this.remoteMaxPayloadBytes,
+            );
+            if (!encoded) {
+                return false;
+            }
+            this.socket.send(encoded);
             return true;
         } catch (error) {
             this.logger.debug?.('[pip-mini-chat] Desktop bridge send failed', error);
@@ -338,6 +389,13 @@ export class DesktopBridge {
         }
 
         if (message.type === 'bridge:ready') {
+            const advertisedMaximum = Number(message.payload?.maxPayloadBytes);
+            if (Number.isFinite(advertisedMaximum) && advertisedMaximum > 0) {
+                this.remoteMaxPayloadBytes = Math.min(
+                    MAX_DESKTOP_MESSAGE_BYTES,
+                    Math.max(LEGACY_DESKTOP_MESSAGE_BYTES, advertisedMaximum - 65_536),
+                );
+            }
             this.setStatus('connected');
             this.sendGenerationState();
             this.sync(true);
