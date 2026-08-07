@@ -129,7 +129,7 @@ function updateAppearanceSettings(patch) {
 function notifyError(message, error = null) {
     console.error(`[${EXTENSION_NAME}] ${message}`, error ?? '');
     if (globalThis.toastr?.error) {
-        globalThis.toastr.error(message, '小窗模式');
+        globalThis.toastr.error(message, '隐蔽小窗');
     }
     setStatus(message, 'error');
 }
@@ -655,12 +655,12 @@ function applyAppearanceSettings() {
     root.style.setProperty('--pip-font-size', `${appearanceSettings.fontSize}px`);
     root.style.setProperty('--pip-stealth-opacity', String(appearanceSettings.stealthOpacity));
     root.dataset.stealthMode = String(appearanceSettings.stealthMode);
-    pipWindow.document.title = appearanceSettings.stealthMode ? 'Window' : 'PiP Mini Chat';
+    pipWindow.document.title = appearanceSettings.stealthMode ? 'Window' : '隐蔽小窗';
 }
 
 function buildPipDocument(targetWindow) {
     const doc = targetWindow.document;
-    doc.title = appearanceSettings.stealthMode ? 'Window' : 'PiP Mini Chat';
+    doc.title = appearanceSettings.stealthMode ? 'Window' : '隐蔽小窗';
     doc.body.innerHTML = `
         <main class="pip-mini-chat">
             <header class="pip-mini-chat__header">
@@ -1067,9 +1067,9 @@ function createLauncherButton({ id, variant }) {
         : 'pip-mini-chat-floating-launcher interactable';
     button.tabIndex = 0;
     button.role = 'button';
-    button.title = 'Open small window mode';
+    button.title = '打开隐蔽小窗';
     button.innerHTML = variant === 'menu'
-        ? `${getLauncherIcon()}<span>小窗模式</span>`
+        ? `${getLauncherIcon()}<span>隐蔽小窗</span>`
         : getLauncherIcon();
     button.addEventListener('click', event => {
         if (button.dataset.dragMoved === 'true') {
@@ -1287,7 +1287,7 @@ function registerSettingsPanel() {
     panel.innerHTML = `
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>小窗模式</b>
+                <b>隐蔽小窗</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
