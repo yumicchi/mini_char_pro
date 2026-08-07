@@ -143,6 +143,10 @@
     margin: 0;
 }
 
+#pip-mini-chat-desktop-sync-now {
+    grid-column: 1 / -1;
+}
+
 .pip-mini-chat-settings__field input[type="color"] {
     width: 48px;
     height: 30px;

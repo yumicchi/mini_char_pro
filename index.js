@@ -65,6 +65,8 @@ let desktopBridgeStatus = {
 };
 let desktopMutationObserver = null;
 let desktopObservedChat = null;
+let desktopSyncHeartbeatTimer = null;
+let lastDesktopChatSignature = '';
 let compatibleSendMode = readBooleanSetting({
     storage: globalThis.localStorage,
     key: COMPATIBLE_SEND_MODE_KEY,
@@ -204,7 +206,10 @@ function getTitle(context) {
     }
 
     const character = context.characters?.[context.characterId];
-    return character?.name ?? 'SillyTavern';
+    return character?.name
+        ?? context.name2
+        ?? context.characterName
+        ?? 'SillyTavern';
 }
 
 function refreshPip() {
@@ -644,6 +649,142 @@ function getPipStyles() {
     `;
 }
 
+const RENDERED_BLOCK_SELECTOR = [
+    '.TH-render',
+    '.status-preview-wrapper',
+    '#ny-status',
+    'iframe',
+].join(', ');
+
+function getAccessibleFrameDocument(frame) {
+    try {
+        const doc = frame?.contentDocument ?? frame?.contentWindow?.document;
+        return doc?.body ? doc : null;
+    } catch {
+        return null;
+    }
+}
+
+function absolutizeClonedResources(sourceRoot, cloneRoot) {
+    const sourceElements = [sourceRoot, ...(sourceRoot.querySelectorAll?.('*') ?? [])];
+    const cloneElements = [cloneRoot, ...(cloneRoot.querySelectorAll?.('*') ?? [])];
+    const urlProperties = ['src', 'href', 'poster'];
+
+    for (let index = 0; index < sourceElements.length; index += 1) {
+        const source = sourceElements[index];
+        const clone = cloneElements[index];
+        if (!clone) {
+            continue;
+        }
+
+        for (const property of urlProperties) {
+            if (!source.hasAttribute?.(property)) {
+                continue;
+            }
+
+            const absolute = source[property];
+            if (/^(?:https?:|data:|blob:)/i.test(String(absolute ?? ''))) {
+                clone.setAttribute(property, absolute);
+            }
+        }
+    }
+}
+
+function copyFrameRootAppearance(frameDocument, wrapper) {
+    try {
+        const styles = frameDocument.defaultView?.getComputedStyle?.(frameDocument.body);
+        const properties = [
+            'background',
+            'background-color',
+            'background-image',
+            'color',
+            'font-family',
+            'font-size',
+            'font-style',
+            'font-weight',
+            'letter-spacing',
+            'line-height',
+            'padding',
+            'text-align',
+        ];
+
+        for (const property of properties) {
+            const value = styles?.getPropertyValue?.(property);
+            if (value) {
+                wrapper.style.setProperty(property, value);
+            }
+        }
+
+        const rootStyles = frameDocument.defaultView?.getComputedStyle?.(
+            frameDocument.documentElement,
+        );
+        for (const name of rootStyles ?? []) {
+            if (name.startsWith('--')) {
+                wrapper.style.setProperty(name, rootStyles.getPropertyValue(name));
+            }
+        }
+    } catch {
+        // Computed styles are best-effort; serialized style elements remain available.
+    }
+}
+
+function serializeFrameDocument(frame) {
+    const frameDocument = getAccessibleFrameDocument(frame);
+    if (!frameDocument) {
+        return null;
+    }
+
+    const wrapper = document.createElement('section');
+    wrapper.className = 'pip-mini-chat-embedded-document';
+    wrapper.dataset.pipEmbeddedDocument = 'true';
+    copyFrameRootAppearance(frameDocument, wrapper);
+
+    for (const source of frameDocument.head?.querySelectorAll?.(
+        'style, link[rel~="stylesheet"]',
+    ) ?? []) {
+        const clone = source.cloneNode(true);
+        if (source.matches?.('link') && source.href) {
+            clone.href = source.href;
+        }
+        wrapper.append(clone);
+    }
+
+    const bodyClone = cloneRenderedNode(frameDocument.body);
+    while (bodyClone.firstChild) {
+        wrapper.append(bodyClone.firstChild);
+    }
+
+    return wrapper;
+}
+
+function cloneRenderedNode(sourceNode) {
+    const clone = sourceNode.cloneNode(true);
+    absolutizeClonedResources(sourceNode, clone);
+    const sourceFrames = [...(sourceNode.querySelectorAll?.('iframe') ?? [])];
+    const cloneFrames = [...(clone.querySelectorAll?.('iframe') ?? [])];
+
+    for (let index = 0; index < sourceFrames.length; index += 1) {
+        const serialized = serializeFrameDocument(sourceFrames[index]);
+        if (serialized && cloneFrames[index]) {
+            cloneFrames[index].replaceWith(serialized);
+        }
+    }
+
+    return clone;
+}
+
+function getExtraRenderedBlocks(messageElement, textElement) {
+    const candidates = [...messageElement.querySelectorAll(RENDERED_BLOCK_SELECTOR)];
+    return candidates.filter(candidate => {
+        if (textElement.contains(candidate)) {
+            return false;
+        }
+
+        const renderedParent = candidate.parentElement?.closest?.(RENDERED_BLOCK_SELECTOR);
+        return !renderedParent || !messageElement.contains(renderedParent);
+    });
+}
+
 function getRenderedLatestAssistantHtml(context) {
     const latest = findLatestAssistantMessage(context?.chat);
     if (!latest) {
@@ -656,13 +797,25 @@ function getRenderedLatestAssistantHtml(context) {
         return null;
     }
 
-    const html = sanitizeRenderedMessageHtml(textElement);
+    const html = sanitizeRenderedMessageHtml(textElement, messageElement);
     return html || null;
 }
 
-function sanitizeRenderedMessageHtml(textElement) {
-    const clone = textElement.cloneNode(true);
-    const hasRenderedBlock = clone.querySelector?.('.TH-render, .status-preview-wrapper, #ny-status');
+function sanitizeRenderedMessageHtml(textElement, messageElement = textElement) {
+    const clone = cloneRenderedNode(textElement);
+
+    for (const renderedBlock of getExtraRenderedBlocks(messageElement, textElement)) {
+        const renderedClone = renderedBlock.matches?.('iframe')
+            ? serializeFrameDocument(renderedBlock)
+            : cloneRenderedNode(renderedBlock);
+        if (renderedClone) {
+            clone.append(renderedClone);
+        }
+    }
+
+    const hasRenderedBlock = clone.querySelector?.(
+        '.TH-render, .status-preview-wrapper, #ny-status, .pip-mini-chat-embedded-document',
+    );
 
     if (hasRenderedBlock) {
         removeRawHtmlSourceBlocks(clone);
@@ -690,7 +843,7 @@ function removeRawHtmlSourceBlocks(root) {
 
 function looksLikeRawHtmlSource(text) {
     const value = String(text ?? '');
-    return /<!doctype\s+html|<html[\s>]|&lt;!doctype\s+html|&lt;html[\s&gt;]/i.test(value);
+    return /<!doctype\s+html|<(?:html|body|script)\b|&lt;!doctype\s+html|&lt;(?:html|body|script)\b/i.test(value);
 }
 
 function findRenderedMessageElement(messageIndex, chatLength) {
@@ -748,6 +901,28 @@ function normalizeInteractionText(value) {
     return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
+function collectRenderedInteractionRoots(root) {
+    const roots = [root];
+    const frames = [...(root.querySelectorAll?.('iframe') ?? [])];
+
+    for (const frame of frames) {
+        const frameDocument = getAccessibleFrameDocument(frame);
+        if (!frameDocument?.body) {
+            continue;
+        }
+
+        roots.push(frameDocument.body);
+        for (const nestedFrame of frameDocument.body.querySelectorAll('iframe')) {
+            const nestedDocument = getAccessibleFrameDocument(nestedFrame);
+            if (nestedDocument?.body) {
+                roots.push(nestedDocument.body);
+            }
+        }
+    }
+
+    return roots;
+}
+
 function findDesktopInteractionTarget(payload = {}) {
     const context = getContext();
     const latest = findLatestAssistantMessage(context?.chat);
@@ -761,36 +936,44 @@ function findDesktopInteractionTarget(payload = {}) {
         return null;
     }
 
+    const roots = collectRenderedInteractionRoots(root);
+
     if (payload.id) {
-        const exact = document.getElementById(String(payload.id));
-        if (exact && root.contains(exact)) {
-            return exact;
+        for (const interactionRoot of roots) {
+            const exact = interactionRoot.querySelector?.(
+                '#' + globalThis.CSS.escape(String(payload.id)),
+            );
+            if (exact) {
+                return exact;
+            }
         }
     }
 
     const expectedText = normalizeInteractionText(payload.text);
     const expectedValue = normalizeInteractionText(payload.value);
     const expectedAction = normalizeInteractionText(payload.action);
-    const candidates = root.querySelectorAll(
-        '[data-veil-action], [data-pip-input], [data-option], .option-item, button',
-    );
+    for (const interactionRoot of roots) {
+        const candidates = interactionRoot.querySelectorAll(
+            '[data-veil-action], [data-pip-input], [data-option], .option-item, button',
+        );
 
-    for (const candidate of candidates) {
-        const values = [
-            candidate.dataset?.veilAction,
-            candidate.dataset?.pipInput,
-            candidate.dataset?.option,
-            candidate.dataset?.value,
-            candidate.querySelector?.('.option-text')?.textContent,
-            candidate.textContent,
-        ].map(normalizeInteractionText);
+        for (const candidate of candidates) {
+            const values = [
+                candidate.dataset?.veilAction,
+                candidate.dataset?.pipInput,
+                candidate.dataset?.option,
+                candidate.dataset?.value,
+                candidate.querySelector?.('.option-text')?.textContent,
+                candidate.textContent,
+            ].map(normalizeInteractionText);
 
-        if (
-            (expectedAction && values.includes(expectedAction))
-            || (expectedValue && values.includes(expectedValue))
-            || (expectedText && values.includes(expectedText))
-        ) {
-            return candidate;
+            if (
+                (expectedAction && values.includes(expectedAction))
+                || (expectedValue && values.includes(expectedValue))
+                || (expectedText && values.includes(expectedText))
+            ) {
+                return candidate;
+            }
         }
     }
 
@@ -859,7 +1042,7 @@ function initializeDesktopBridge() {
 function installDesktopMutationObserver() {
     const chat = document.querySelector('#chat');
     if (!chat || chat === desktopObservedChat) {
-        return;
+        return false;
     }
 
     desktopMutationObserver?.disconnect();
@@ -872,6 +1055,49 @@ function installDesktopMutationObserver() {
         childList: true,
         characterData: true,
         attributes: true,
+    });
+    desktopBridge?.sync(true);
+    return true;
+}
+
+function getDesktopChatSignature() {
+    const context = getContext();
+    const latest = findLatestAssistantMessage(context?.chat);
+    const text = String(latest?.message?.mes ?? '');
+
+    return JSON.stringify({
+        characterId: context?.characterId ?? null,
+        groupId: context?.groupId ?? null,
+        chatId: context?.chatId ?? context?.chat_id ?? null,
+        chatLength: Array.isArray(context?.chat) ? context.chat.length : 0,
+        latestIndex: latest?.index ?? -1,
+        latestLength: text.length,
+        latestTail: text.slice(-160),
+    });
+}
+
+function startDesktopSyncHeartbeat() {
+    if (desktopSyncHeartbeatTimer) {
+        return;
+    }
+
+    desktopSyncHeartbeatTimer = window.setInterval(() => {
+        const observerChanged = installDesktopMutationObserver();
+        const signature = getDesktopChatSignature();
+        if (observerChanged || signature !== lastDesktopChatSignature) {
+            lastDesktopChatSignature = signature;
+            desktopBridge?.sync(true);
+        } else {
+            desktopBridge?.sync();
+        }
+    }, 1000);
+
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+            installDesktopMutationObserver();
+            lastDesktopChatSignature = getDesktopChatSignature();
+            desktopBridge?.sync(true);
+        }
     });
 }
 
@@ -1670,6 +1896,7 @@ function registerSettingsPanel() {
                     <div class="pip-mini-chat-settings__desktop-actions">
                         <button id="pip-mini-chat-desktop-apply-config" type="button" class="menu_button">应用连接配置</button>
                         <button id="pip-mini-chat-desktop-reconnect" type="button" class="menu_button">重新连接</button>
+                        <button id="pip-mini-chat-desktop-sync-now" type="button" class="menu_button">立即同步当前聊天</button>
                     </div>
                     <small class="pip-mini-chat-settings__hint">
                         隐窗伴侣需要先启动。通信仅允许 127.0.0.1、localhost 或本机 IPv6 回环地址。
@@ -1714,6 +1941,16 @@ function registerSettingsPanel() {
     });
     panel.querySelector('#pip-mini-chat-desktop-reconnect').addEventListener('click', () => {
         desktopBridge?.connect();
+    });
+    panel.querySelector('#pip-mini-chat-desktop-sync-now').addEventListener('click', () => {
+        installDesktopMutationObserver();
+        lastDesktopChatSignature = getDesktopChatSignature();
+        const sent = desktopBridge?.sync(true);
+        if (sent) {
+            globalThis.toastr?.success?.('当前聊天已同步到隐窗伴侣。', '隐蔽小窗');
+        } else {
+            globalThis.toastr?.warning?.('隐窗伴侣尚未连接。', '隐蔽小窗');
+        }
     });
 
     panel.querySelector('#pip-mini-chat-use-theme-background').addEventListener('change', event => {
@@ -1807,6 +2044,7 @@ function init() {
     registerPipEventListeners();
     initializeDesktopBridge();
     installDesktopMutationObserver();
+    startDesktopSyncHeartbeat();
     startLauncherRetry();
 }
 
