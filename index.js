@@ -25,6 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
+const EXTENSION_VERSION = '1.3.0';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const LAUNCHER_RETRY_LIMIT = 20;
@@ -728,9 +729,26 @@ function copyFrameRootAppearance(frameDocument, wrapper) {
     }
 }
 
-function serializeFrameDocument(frame) {
+function frameDocumentHasRenderableContent(frameDocument) {
+    for (const node of frameDocument?.body?.childNodes ?? []) {
+        if (node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) {
+            return true;
+        }
+
+        if (
+            node.nodeType === Node.ELEMENT_NODE
+            && !['SCRIPT', 'STYLE', 'LINK', 'META', 'BASE', 'TEMPLATE'].includes(node.tagName)
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function serializeFrameDocument(frame, diagnostics = null) {
     const frameDocument = getAccessibleFrameDocument(frame);
-    if (!frameDocument) {
+    if (!frameDocument || !frameDocumentHasRenderableContent(frameDocument)) {
         return null;
     }
 
@@ -749,22 +767,33 @@ function serializeFrameDocument(frame) {
         wrapper.append(clone);
     }
 
-    const bodyClone = cloneRenderedNode(frameDocument.body);
+    const bodyClone = cloneRenderedNode(frameDocument.body, diagnostics);
     while (bodyClone.firstChild) {
         wrapper.append(bodyClone.firstChild);
+    }
+
+    if (diagnostics) {
+        diagnostics.serializedFrameCount += 1;
     }
 
     return wrapper;
 }
 
-function cloneRenderedNode(sourceNode) {
+function cloneRenderedNode(sourceNode, diagnostics = null) {
     const clone = sourceNode.cloneNode(true);
     absolutizeClonedResources(sourceNode, clone);
     const sourceFrames = [...(sourceNode.querySelectorAll?.('iframe') ?? [])];
     const cloneFrames = [...(clone.querySelectorAll?.('iframe') ?? [])];
 
     for (let index = 0; index < sourceFrames.length; index += 1) {
-        const serialized = serializeFrameDocument(sourceFrames[index]);
+        if (diagnostics) {
+            diagnostics.frameCount += 1;
+            if (sourceFrames[index].closest?.('.TH-render')) {
+                diagnostics.frontendFrameCount += 1;
+            }
+        }
+
+        const serialized = serializeFrameDocument(sourceFrames[index], diagnostics);
         if (serialized && cloneFrames[index]) {
             cloneFrames[index].replaceWith(serialized);
         }
@@ -786,6 +815,10 @@ function getExtraRenderedBlocks(messageElement, textElement) {
 }
 
 function getRenderedLatestAssistantHtml(context) {
+    return getRenderedLatestAssistantSnapshot(context)?.html || null;
+}
+
+function getRenderedLatestAssistantSnapshot(context) {
     const latest = findLatestAssistantMessage(context?.chat);
     if (!latest) {
         return null;
@@ -797,31 +830,51 @@ function getRenderedLatestAssistantHtml(context) {
         return null;
     }
 
-    const html = sanitizeRenderedMessageHtml(textElement, messageElement);
-    return html || null;
+    return sanitizeRenderedMessageSnapshot(textElement, messageElement);
 }
 
-function sanitizeRenderedMessageHtml(textElement, messageElement = textElement) {
-    const clone = cloneRenderedNode(textElement);
+function sanitizeRenderedMessageSnapshot(textElement, messageElement = textElement) {
+    const diagnostics = {
+        frameCount: 0,
+        frontendFrameCount: 0,
+        serializedFrameCount: 0,
+    };
+    const sourceCandidates = textElement.querySelectorAll?.('p, pre, code, textarea') ?? [];
+    const containsFrontendSource = [...sourceCandidates]
+        .some(element => looksLikeRawHtmlSource(element.textContent ?? ''));
+    const clone = cloneRenderedNode(textElement, diagnostics);
 
     for (const renderedBlock of getExtraRenderedBlocks(messageElement, textElement)) {
-        const renderedClone = renderedBlock.matches?.('iframe')
-            ? serializeFrameDocument(renderedBlock)
-            : cloneRenderedNode(renderedBlock);
+        let renderedClone;
+        if (renderedBlock.matches?.('iframe')) {
+            diagnostics.frameCount += 1;
+            if (renderedBlock.closest?.('.TH-render')) {
+                diagnostics.frontendFrameCount += 1;
+            }
+            renderedClone = serializeFrameDocument(renderedBlock, diagnostics);
+        } else {
+            renderedClone = cloneRenderedNode(renderedBlock, diagnostics);
+        }
         if (renderedClone) {
             clone.append(renderedClone);
         }
     }
 
-    const hasRenderedBlock = clone.querySelector?.(
-        '.TH-render, .status-preview-wrapper, #ny-status, .pip-mini-chat-embedded-document',
+    const hasFinalRenderedBlock = diagnostics.serializedFrameCount > 0 || clone.querySelector?.(
+        '.status-preview-wrapper, #ny-status, .pip-mini-chat-embedded-document',
     );
 
-    if (hasRenderedBlock) {
+    if (hasFinalRenderedBlock) {
         removeRawHtmlSourceBlocks(clone);
+        clone.querySelectorAll?.('.TH-collapse-code-block-button').forEach(element => element.remove());
     }
 
-    return clone.innerHTML?.trim() ?? '';
+    return {
+        html: clone.innerHTML?.trim() ?? '',
+        containsFrontendSource,
+        hasFinalRenderedBlock: Boolean(hasFinalRenderedBlock),
+        ...diagnostics,
+    };
 }
 
 function removeRawHtmlSourceBlocks(root) {
@@ -844,6 +897,21 @@ function removeRawHtmlSourceBlocks(root) {
 function looksLikeRawHtmlSource(text) {
     const value = String(text ?? '');
     return /<!doctype\s+html|<(?:html|body|script)\b|&lt;!doctype\s+html|&lt;(?:html|body|script)\b/i.test(value);
+}
+
+function extractDesktopFallbackText(rawMessage) {
+    const value = String(rawMessage ?? '');
+    const optionBlocks = [...value.matchAll(/<w2g(?:\s[^>]*)?>([\s\S]*?)<\/w2g\s*>/gi)]
+        .map(match => match[1].trim())
+        .filter(Boolean);
+    if (optionBlocks.length) {
+        return optionBlocks.join('\n\n');
+    }
+
+    return value
+        .replace(/<update(?:\s[^>]*)?>[\s\S]*?<\/update\s*>/gi, '')
+        .replace(/```(?:html?)?\s*[\s\S]*?<(?:html|body|script)\b[\s\S]*?```/gi, '')
+        .trim();
 }
 
 function findRenderedMessageElement(messageIndex, chatLength) {
@@ -883,15 +951,27 @@ function getDesktopRenderPayload() {
     syncGenerationState();
     const context = getContext();
     const latest = findLatestAssistantMessage(context?.chat);
-    const html = getRenderedLatestAssistantHtml(context) ?? formatLatestAssistantMessage({
+    const rawText = String(latest?.message?.mes ?? '');
+    const renderedSnapshot = getRenderedLatestAssistantSnapshot(context);
+    let html = renderedSnapshot?.html || formatLatestAssistantMessage({
         chat: context?.chat,
         formatter: context?.messageFormatting,
     });
+    let text = rawText;
+
+    if (
+        renderedSnapshot?.containsFrontendSource
+        && renderedSnapshot.serializedFrameCount === 0
+    ) {
+        html = '';
+        text = extractDesktopFallbackText(rawText)
+            || '正在等待酒馆助手完成前端界面渲染……';
+    }
 
     return {
         title: getTitle(context),
         html,
-        text: String(latest?.message?.mes ?? ''),
+        text,
         streaming: isGenerating,
         themeVariables: collectThemeVariables(getComputedStyle(document.documentElement)),
     };
@@ -1868,7 +1948,7 @@ function registerSettingsPanel() {
                 </div>
 
                 <div class="pip-mini-chat-settings__section pip-mini-chat-settings__section--desktop">
-                    <div class="pip-mini-chat-settings__section-title">隐窗伴侣</div>
+                    <div class="pip-mini-chat-settings__section-title">隐窗伴侣（插件 v${EXTENSION_VERSION}）</div>
                     <label class="checkbox_label pip-mini-chat-settings__row" for="pip-mini-chat-desktop-enabled">
                         <input id="pip-mini-chat-desktop-enabled" type="checkbox" class="checkbox">
                         <span>启用桌面伴侣通信</span>
