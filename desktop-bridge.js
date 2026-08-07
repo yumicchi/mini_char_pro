@@ -5,6 +5,7 @@ const LOCAL_BRIDGE_HOSTS = new Set([
 ]);
 
 const DESKTOP_ACTION_TYPES = new Set([
+    'composer:update',
     'composer:send',
     'generation:retry',
     'generation:stop',
@@ -410,10 +411,15 @@ export class DesktopBridge {
         }
 
         try {
-            await this.onAction?.({
+            const result = await this.onAction?.({
                 type: message.type,
                 payload: message.payload || {},
             });
+            if (typeof result?.composerText === 'string') {
+                this.send('composer:update', {
+                    text: result.composerText,
+                });
+            }
             this.sendGenerationState();
             this.scheduleSync(30);
         } catch (error) {

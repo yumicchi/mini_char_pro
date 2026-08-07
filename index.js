@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.3.2';
+const EXTENSION_VERSION = '1.4.0';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const LAUNCHER_RETRY_LIMIT = 20;
@@ -68,6 +68,10 @@ let desktopMutationObserver = null;
 let desktopObservedChat = null;
 let desktopSyncHeartbeatTimer = null;
 let lastDesktopChatSignature = '';
+let desktopComposerSyncTimer = null;
+let desktopComposerInputListenerInstalled = false;
+let applyingDesktopComposerUpdate = false;
+let lastDesktopComposerText = '';
 let compatibleSendMode = readBooleanSetting({
     storage: globalThis.localStorage,
     key: COMPATIBLE_SEND_MODE_KEY,
@@ -1178,7 +1182,21 @@ function findDesktopInteractionTarget(payload = {}) {
     return null;
 }
 
-function handleDesktopInteraction(payload = {}) {
+async function waitForComposerTextChange(previousValue, timeout = 300) {
+    const deadline = Date.now() + timeout;
+    let currentValue = String(document.querySelector('#send_textarea')?.value ?? '');
+
+    while (currentValue === previousValue && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        currentValue = String(document.querySelector('#send_textarea')?.value ?? '');
+    }
+
+    return currentValue;
+}
+
+async function handleDesktopInteraction(payload = {}) {
+    const textareaBeforeClick = document.querySelector('#send_textarea');
+    const previousComposerText = String(textareaBeforeClick?.value ?? '');
     const target = findDesktopInteractionTarget(payload);
     if (target) {
         if (typeof target.click === 'function') {
@@ -1191,22 +1209,93 @@ function handleDesktopInteraction(payload = {}) {
                 composed: true,
             }));
         }
-        return true;
+
+        const composerText = await waitForComposerTextChange(previousComposerText);
+        return {
+            handled: true,
+            composerText: composerText !== previousComposerText ? composerText : null,
+        };
     }
 
     const text = String(payload.text ?? '').trim();
     const textarea = document.querySelector('#send_textarea');
     if (!text || !textarea) {
-        return false;
+        return { handled: false, composerText: null };
     }
 
     textarea.value = String(textarea.value ?? '') + text;
     textarea.dispatchEvent(new Event('input', { bubbles: true }));
     textarea.focus();
+    return { handled: true, composerText: textarea.value };
+}
+
+function getSillyTavernComposerText() {
+    return String(document.querySelector('#send_textarea')?.value ?? '');
+}
+
+function sendDesktopComposerUpdate(force = false) {
+    const text = getSillyTavernComposerText();
+    if (!force && text === lastDesktopComposerText) {
+        return false;
+    }
+
+    const sent = desktopBridge?.send('composer:update', { text }) ?? false;
+    if (sent) {
+        lastDesktopComposerText = text;
+    }
+    return sent;
+}
+
+function scheduleDesktopComposerUpdate(delay = 70) {
+    clearTimeout(desktopComposerSyncTimer);
+    desktopComposerSyncTimer = setTimeout(() => {
+        desktopComposerSyncTimer = null;
+        sendDesktopComposerUpdate();
+    }, delay);
+}
+
+function applyDesktopComposerText(value) {
+    const textarea = document.querySelector('#send_textarea');
+    if (!textarea) {
+        return false;
+    }
+
+    const text = String(value ?? '').slice(0, 20_000);
+    if (textarea.value === text) {
+        lastDesktopComposerText = text;
+        return true;
+    }
+
+    applyingDesktopComposerUpdate = true;
+    textarea.value = text;
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    applyingDesktopComposerUpdate = false;
+    lastDesktopComposerText = text;
     return true;
 }
 
+function installDesktopComposerSync() {
+    if (desktopComposerInputListenerInstalled) {
+        return;
+    }
+
+    desktopComposerInputListenerInstalled = true;
+    document.addEventListener('input', event => {
+        if (
+            applyingDesktopComposerUpdate
+            || !event.target?.matches?.('#send_textarea')
+        ) {
+            return;
+        }
+        scheduleDesktopComposerUpdate();
+    }, true);
+}
+
 async function handleDesktopBridgeAction(message) {
+    if (message.type === 'composer:update') {
+        applyDesktopComposerText(message.payload?.text);
+        return null;
+    }
     if (message.type === 'composer:send') {
         await sendTextToSillyTavern(String(message.payload?.text ?? ''));
         return;
@@ -1220,8 +1309,10 @@ async function handleDesktopBridgeAction(message) {
         return;
     }
     if (message.type === 'interaction:select') {
-        handleDesktopInteraction(message.payload);
+        return handleDesktopInteraction(message.payload);
     }
+
+    return null;
 }
 
 function initializeDesktopBridge() {
@@ -1241,6 +1332,9 @@ function initializeDesktopBridge() {
         onStatus: status => {
             desktopBridgeStatus = status;
             syncDesktopBridgeSettingsPanel();
+            if (status.state === 'connected') {
+                sendDesktopComposerUpdate(true);
+            }
         },
     });
     desktopBridge.start();
@@ -2250,6 +2344,7 @@ function init() {
     registerLauncher();
     registerPipEventListeners();
     initializeDesktopBridge();
+    installDesktopComposerSync();
     installDesktopMutationObserver();
     startDesktopSyncHeartbeat();
     startLauncherRetry();
