@@ -1,0 +1,1476 @@
+import {
+    bindEventHandlers,
+    buildThemeVariableCss,
+    buildEventList,
+    collectThemeVariables,
+    findLatestAssistantMessage,
+    formatLatestAssistantMessage,
+    getLauncherTargets,
+    getTextareaRowCount,
+    normalizeFloatingPosition,
+    readBooleanSetting,
+    readGenerationState,
+    sendDraftToSillyTavern,
+    shouldClosePipWindow,
+    triggerRegenerate,
+    writeBooleanSetting,
+} from './core.js';
+
+const EXTENSION_NAME = 'pip-mini-chat';
+const PIP_WIDTH = 380;
+const PIP_HEIGHT = 360;
+const LAUNCHER_RETRY_LIMIT = 20;
+const FLOATING_POSITION_KEY = 'pip-mini-chat-floating-position';
+const COMPATIBLE_SEND_MODE_KEY = 'pip-mini-chat-compatible-send-mode';
+const APPEARANCE_SETTINGS_KEY = 'pip-mini-chat-appearance-settings';
+const FLOATING_DRAG_MARGIN = 8;
+const FONT_FAMILIES = Object.freeze({
+    system: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    sans: '"Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif',
+    serif: '"Songti SC", SimSun, "Noto Serif CJK SC", serif',
+    kai: 'KaiTi, STKaiti, "Noto Serif CJK SC", serif',
+    mono: 'Consolas, "Cascadia Mono", "Microsoft YaHei", monospace',
+});
+const DEFAULT_APPEARANCE_SETTINGS = Object.freeze({
+    useThemeBackground: true,
+    backgroundColor: '#171717',
+    backgroundOpacity: 1,
+    fontFamily: 'system',
+    fontSize: 14,
+    textOpacity: 1,
+    stealthMode: false,
+    stealthOpacity: 0.18,
+});
+
+let pipWindow = null;
+let pipElements = null;
+let sendTextareaMessage = null;
+let sillyTavernIsGenerating = null;
+let isGenerating = false;
+let cleanupPipEventListeners = null;
+let launcherRetryCount = 0;
+let launcherRetryTimer = null;
+let lastRenderedOutputHtml = '';
+let compatibleSendMode = readBooleanSetting({
+    storage: globalThis.localStorage,
+    key: COMPATIBLE_SEND_MODE_KEY,
+    fallback: false,
+});
+let appearanceSettings = readAppearanceSettings();
+
+function getContext() {
+    return globalThis.SillyTavern?.getContext?.();
+}
+
+function getEventTypes(context) {
+    return context?.eventTypes ?? context?.event_types ?? {};
+}
+
+function clampNumber(value, minimum, maximum, fallback) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        return fallback;
+    }
+
+    return Math.min(Math.max(number, minimum), maximum);
+}
+
+function normalizeAppearanceSettings(value = {}) {
+    const backgroundColor = /^#[0-9a-f]{6}$/i.test(String(value.backgroundColor ?? ''))
+        ? String(value.backgroundColor)
+        : DEFAULT_APPEARANCE_SETTINGS.backgroundColor;
+    const fontFamily = Object.hasOwn(FONT_FAMILIES, value.fontFamily)
+        ? value.fontFamily
+        : DEFAULT_APPEARANCE_SETTINGS.fontFamily;
+
+    return {
+        useThemeBackground: typeof value.useThemeBackground === 'boolean'
+            ? value.useThemeBackground
+            : DEFAULT_APPEARANCE_SETTINGS.useThemeBackground,
+        backgroundColor,
+        backgroundOpacity: clampNumber(value.backgroundOpacity, 0.1, 1, DEFAULT_APPEARANCE_SETTINGS.backgroundOpacity),
+        fontFamily,
+        fontSize: clampNumber(value.fontSize, 10, 24, DEFAULT_APPEARANCE_SETTINGS.fontSize),
+        textOpacity: clampNumber(value.textOpacity, 0.1, 1, DEFAULT_APPEARANCE_SETTINGS.textOpacity),
+        stealthMode: typeof value.stealthMode === 'boolean'
+            ? value.stealthMode
+            : DEFAULT_APPEARANCE_SETTINGS.stealthMode,
+        stealthOpacity: clampNumber(value.stealthOpacity, 0.05, 0.6, DEFAULT_APPEARANCE_SETTINGS.stealthOpacity),
+    };
+}
+
+function readAppearanceSettings() {
+    try {
+        const raw = globalThis.localStorage?.getItem?.(APPEARANCE_SETTINGS_KEY);
+        return normalizeAppearanceSettings(raw ? JSON.parse(raw) : DEFAULT_APPEARANCE_SETTINGS);
+    } catch {
+        return { ...DEFAULT_APPEARANCE_SETTINGS };
+    }
+}
+
+function writeAppearanceSettings() {
+    try {
+        globalThis.localStorage?.setItem?.(APPEARANCE_SETTINGS_KEY, JSON.stringify(appearanceSettings));
+    } catch {
+        // Appearance persistence is optional when storage is unavailable.
+    }
+}
+
+function updateAppearanceSettings(patch) {
+    appearanceSettings = normalizeAppearanceSettings({
+        ...appearanceSettings,
+        ...patch,
+    });
+    writeAppearanceSettings();
+    applyAppearanceSettings();
+    syncAppearanceSettingsPanel();
+}
+
+function notifyError(message, error = null) {
+    console.error(`[${EXTENSION_NAME}] ${message}`, error ?? '');
+    if (globalThis.toastr?.error) {
+        globalThis.toastr.error(message, '小窗模式');
+    }
+    setStatus(message, 'error');
+}
+
+function setStatus(text, type = 'idle') {
+    if (!pipElements?.status) {
+        return;
+    }
+
+    pipElements.status.textContent = text;
+    pipElements.status.dataset.state = type;
+}
+
+function getTitle(context) {
+    if (!context) {
+        return 'SillyTavern';
+    }
+
+    if (context.groupId) {
+        const group = context.groups?.find(item => item.id === context.groupId);
+        return group?.name ?? 'Group Chat';
+    }
+
+    const character = context.characters?.[context.characterId];
+    return character?.name ?? 'SillyTavern';
+}
+
+function refreshPip() {
+    if (!pipElements || pipWindow?.closed) {
+        return;
+    }
+
+    syncGenerationState();
+    const context = getContext();
+    const outputHtml = getRenderedLatestAssistantHtml(context) ?? formatLatestAssistantMessage({
+        chat: context?.chat,
+        formatter: context?.messageFormatting,
+    });
+    pipElements.title.textContent = getTitle(context);
+    if (outputHtml !== lastRenderedOutputHtml) {
+        lastRenderedOutputHtml = outputHtml;
+        pipElements.output.innerHTML = outputHtml;
+        bridgeHostGlobalsToPipWindow();
+        executeOutputScripts(pipElements.output);
+        updatePipScrollbar();
+        pipWindow.setTimeout(updatePipScrollbar, 0);
+    }
+    updateControls();
+}
+
+function updateControls() {
+    if (!pipElements) {
+        return;
+    }
+
+    syncGenerationState();
+    const hasText = pipElements.input.value.trim().length > 0;
+    pipElements.send.disabled = isGenerating || !hasText;
+    pipElements.regenerate.disabled = isGenerating || !getContext()?.chat?.length;
+    pipElements.stop.disabled = !isGenerating;
+
+    if (isGenerating) {
+        setStatus('Generating', 'generating');
+    } else if (pipElements.status.dataset.state !== 'error') {
+        setStatus('Idle', 'idle');
+    }
+}
+
+function writePipInput(text, { append = true } = {}) {
+    if (!pipElements?.input) {
+        return false;
+    }
+
+    const value = String(text ?? '');
+    pipElements.input.value = append
+        ? `${pipElements.input.value}${value}`
+        : value;
+    pipElements.input.dispatchEvent(new Event('input', { bubbles: true }));
+    pipElements.input.focus();
+    return true;
+}
+
+async function loadSendTextareaMessage() {
+    if (sendTextareaMessage) {
+        return sendTextareaMessage;
+    }
+
+    const module = await import('/script.js');
+    sendTextareaMessage = module.sendTextareaMessage;
+    sillyTavernIsGenerating = module.isGenerating;
+    return sendTextareaMessage;
+}
+
+async function loadSillyTavernStatusHelpers() {
+    if (sillyTavernIsGenerating) {
+        return;
+    }
+
+    try {
+        const module = await import('/script.js');
+        sillyTavernIsGenerating = module.isGenerating;
+    } catch (error) {
+        console.debug(`[${EXTENSION_NAME}] Could not load SillyTavern status helper`, error);
+    }
+}
+
+function syncGenerationState() {
+    isGenerating = readGenerationState({
+        localState: isGenerating,
+        isGeneratingFn: sillyTavernIsGenerating,
+    });
+}
+
+async function sendDraft() {
+    if (!pipElements) {
+        return;
+    }
+
+    try {
+        const sendMessage = await loadSendTextareaMessage();
+        const textarea = document.querySelector('#send_textarea');
+        const sendButton = compatibleSendMode ? document.querySelector('#send_but') : null;
+        await sendDraftToSillyTavern({
+            text: pipElements.input.value,
+            textarea,
+            inputEventFactory: () => new Event('input', { bubbles: true }),
+            sendTextareaMessage: sendMessage,
+            compatibleIntentTarget: sendButton,
+            compatibleIntentEventFactory: createCompatibleSendIntentEvent,
+        });
+        pipElements.input.value = '';
+        resizePipInput();
+        setStatus('Sent', 'idle');
+        updateControls();
+    } catch (error) {
+        notifyError(error?.message ?? 'Send failed', error);
+    }
+}
+
+function createCompatibleSendIntentEvent() {
+    const options = {
+        bubbles: true,
+        cancelable: true,
+        pointerType: 'mouse',
+        button: 0,
+    };
+
+    if (typeof PointerEvent === 'function') {
+        return new PointerEvent('pointerup', options);
+    }
+
+    return new Event('pointerup', {
+        bubbles: true,
+        cancelable: true,
+    });
+}
+
+function stopGeneration() {
+    try {
+        const context = getContext();
+        context?.stopGeneration?.();
+    } catch (error) {
+        notifyError(error?.message ?? 'Stop failed', error);
+    }
+}
+
+async function regenerateLastMessage() {
+    try {
+        isGenerating = true;
+        updateControls();
+        await triggerRegenerate(getContext());
+    } catch (error) {
+        isGenerating = false;
+        updateControls();
+        notifyError(error?.message ?? 'Regenerate failed', error);
+    }
+}
+
+function getPipStyles() {
+    return `
+        :root {
+            color-scheme: light dark;
+            background: transparent;
+        }
+        * { box-sizing: border-box; }
+        html {
+            height: 100%;
+            overflow: hidden;
+        }
+        body {
+            margin: 0;
+            height: 100%;
+            overflow: hidden;
+            background: transparent;
+            color: var(--SmartThemeBodyColor, #f4f4f5);
+        }
+        .pip-mini-chat {
+            display: grid;
+            grid-template-rows: auto minmax(0, 1fr) auto auto;
+            height: 100vh;
+            min-height: 260px;
+            overflow: hidden;
+            background: color-mix(
+                in srgb,
+                var(--pip-background-color, var(--SmartThemeBlurTintColor, #171717)) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
+            color: color-mix(
+                in srgb,
+                var(--SmartThemeBodyColor, #f4f4f5) var(--pip-text-opacity-percent, 100%),
+                transparent
+            );
+            font-family: var(--pip-font-family, system-ui, sans-serif);
+            font-size: var(--pip-font-size, var(--mainFontSize, 14px));
+            transition: opacity 0.18s ease;
+        }
+        .pip-mini-chat[data-stealth-mode="true"] {
+            opacity: var(--pip-stealth-opacity, 0.18);
+        }
+        .pip-mini-chat[data-stealth-mode="true"]:hover,
+        .pip-mini-chat[data-stealth-mode="true"]:focus-within {
+            opacity: 1;
+        }
+        .pip-mini-chat[data-stealth-mode="true"]:not(:hover):not(:focus-within) {
+            grid-template-rows: 0 minmax(0, 1fr) 0 0;
+        }
+        .pip-mini-chat[data-stealth-mode="true"]:not(:hover):not(:focus-within) .pip-mini-chat__header,
+        .pip-mini-chat[data-stealth-mode="true"]:not(:hover):not(:focus-within) .pip-mini-chat__input,
+        .pip-mini-chat[data-stealth-mode="true"]:not(:hover):not(:focus-within) .pip-mini-chat__actions,
+        .pip-mini-chat[data-stealth-mode="true"]:not(:hover):not(:focus-within) .pip-mini-chat__scrollbar {
+            opacity: 0;
+            pointer-events: none;
+        }
+        .pip-mini-chat__header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--SmartThemeBorderColor, #303036);
+            background: color-mix(
+                in srgb,
+                var(--pip-background-color, var(--SmartThemeBlurTintColor, #202024)) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
+            box-shadow: 0 1px 0 var(--SmartThemeBorderColor, #303036);
+            transition: opacity 0.18s ease;
+        }
+        .pip-mini-chat__title {
+            overflow: hidden;
+            font-size: 1em;
+            font-weight: 700;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .pip-mini-chat__status {
+            flex: 0 0 auto;
+            font-size: 0.86em;
+            color: color-mix(
+                in srgb,
+                var(--SmartThemeQuoteColor, #a1a1aa) var(--pip-text-opacity-percent, 100%),
+                transparent
+            );
+        }
+        .pip-mini-chat__status[data-state="generating"] {
+            color: color-mix(in srgb, #67e8f9 var(--pip-text-opacity-percent, 100%), transparent);
+        }
+        .pip-mini-chat__status[data-state="error"] {
+            color: color-mix(in srgb, #d33 var(--pip-text-opacity-percent, 100%), transparent);
+        }
+        .pip-mini-chat__scroll-wrap {
+            position: relative;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .pip-mini-chat__output {
+            height: 100%;
+            min-height: 120px;
+            overflow-x: hidden;
+            overflow-y: auto;
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+            padding: 12px 26px 12px 12px;
+            color: var(--SmartThemeBodyColor, #f4f4f5);
+            font-size: 1em;
+            line-height: 1.55;
+            opacity: var(--pip-text-opacity, 1);
+            overflow-wrap: anywhere;
+        }
+        .pip-mini-chat__output::-webkit-scrollbar {
+            display: none;
+        }
+        .pip-mini-chat__scrollbar {
+            position: absolute;
+            top: 6px;
+            right: 4px;
+            bottom: 6px;
+            width: 14px;
+            border-radius: 999px;
+            background: color-mix(in srgb, var(--SmartThemeBorderColor, #303036) 38%, transparent);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.15s ease;
+        }
+        .pip-mini-chat__scrollbar[data-visible="true"] {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .pip-mini-chat__scroll-thumb {
+            position: absolute;
+            left: 3px;
+            top: 0;
+            width: 8px;
+            min-height: 24px;
+            border-radius: 999px;
+            background: color-mix(in srgb, var(--SmartThemeQuoteColor, #a1a1aa) 78%, var(--SmartThemeBodyColor, #f4f4f5) 22%);
+            cursor: grab;
+        }
+        .pip-mini-chat__scroll-thumb:hover,
+        .pip-mini-chat__scroll-thumb:active {
+            background: var(--SmartThemeBodyColor, #f4f4f5);
+        }
+        .pip-mini-chat__scroll-thumb:active {
+            cursor: grabbing;
+        }
+        .pip-mini-chat__output > * {
+            max-width: 100%;
+        }
+        .pip-mini-chat-html-document {
+            width: 100%;
+            max-width: 100%;
+        }
+        .pip-mini-chat-html-document img,
+        .pip-mini-chat-html-document svg,
+        .pip-mini-chat-html-document canvas,
+        .pip-mini-chat-html-document video {
+            max-width: 100%;
+        }
+        .pip-mini-chat-empty {
+            color: var(--SmartThemeQuoteColor, #a1a1aa);
+        }
+        .pip-mini-chat__input {
+            display: block;
+            width: calc(100% - 24px);
+            height: 36px;
+            min-height: 36px;
+            max-height: 76px;
+            margin: 0 12px 10px;
+            resize: none;
+            border: 1px solid var(--SmartThemeBorderColor, #3f3f46);
+            border-radius: 8px;
+            padding: 7px 10px;
+            background: color-mix(
+                in srgb,
+                var(--pip-background-color, var(--SmartThemeBlurTintColor, #202024)) var(--pip-background-opacity-percent, 100%),
+                transparent
+            );
+            color: inherit;
+            font: inherit;
+            line-height: 20px;
+            overflow-y: hidden;
+            transition: opacity 0.18s ease;
+        }
+        .pip-mini-chat__input:focus {
+            border-color: var(--SmartThemeUnderlineColor, #22d3ee);
+            outline: none;
+        }
+        .pip-mini-chat__actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 8px;
+            padding: 0 12px 12px;
+            background: transparent;
+            transition: opacity 0.18s ease;
+        }
+        .pip-mini-chat__button {
+            min-height: 36px;
+            border: 1px solid var(--SmartThemeBorderColor, #3f3f46);
+            border-radius: 8px;
+            background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #27272a) 76%, var(--SmartThemeBodyColor, #fafafa) 24%);
+            color: inherit;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .pip-mini-chat__button:hover:not(:disabled) {
+            filter: brightness(1.08);
+        }
+        .pip-mini-chat__button:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+        .pip-mini-chat__button--send {
+            border-color: var(--SmartThemeUnderlineColor, #0891b2);
+            background: color-mix(in srgb, var(--SmartThemeUnderlineColor, #0e7490) 45%, var(--SmartThemeBlurTintColor, #202024) 55%);
+        }
+        .pip-mini-chat__button--stop {
+            border-color: #b44;
+            background: color-mix(in srgb, #b44 38%, var(--SmartThemeBlurTintColor, #202024) 62%);
+        }
+        .pip-mini-chat__button--regenerate {
+            border-color: var(--SmartThemeQuoteColor, #52525b);
+            background: color-mix(in srgb, var(--SmartThemeQuoteColor, #3f3f46) 38%, var(--SmartThemeBlurTintColor, #202024) 62%);
+        }
+    `;
+}
+
+function getRenderedLatestAssistantHtml(context) {
+    const latest = findLatestAssistantMessage(context?.chat);
+    if (!latest) {
+        return null;
+    }
+
+    const messageElement = findRenderedMessageElement(latest.index, context?.chat?.length);
+    const textElement = messageElement?.querySelector?.('.mes_text') ?? messageElement;
+    if (!textElement) {
+        return null;
+    }
+
+    const html = sanitizeRenderedMessageHtml(textElement);
+    return html || null;
+}
+
+function sanitizeRenderedMessageHtml(textElement) {
+    const clone = textElement.cloneNode(true);
+    const hasRenderedBlock = clone.querySelector?.('.TH-render, .status-preview-wrapper, #ny-status');
+
+    if (hasRenderedBlock) {
+        removeRawHtmlSourceBlocks(clone);
+    }
+
+    return clone.innerHTML?.trim() ?? '';
+}
+
+function removeRawHtmlSourceBlocks(root) {
+    const candidates = [...root.querySelectorAll('p, pre, code, textarea, .mes_reasoning, .edit_textarea')];
+
+    for (const element of candidates) {
+        const text = element.textContent ?? '';
+        if (looksLikeRawHtmlSource(text)) {
+            element.remove();
+        }
+    }
+
+    for (const node of [...root.childNodes]) {
+        if (node.nodeType === Node.TEXT_NODE && looksLikeRawHtmlSource(node.textContent ?? '')) {
+            node.remove();
+        }
+    }
+}
+
+function looksLikeRawHtmlSource(text) {
+    const value = String(text ?? '');
+    return /<!doctype\s+html|<html[\s>]|&lt;!doctype\s+html|&lt;html[\s&gt;]/i.test(value);
+}
+
+function findRenderedMessageElement(messageIndex, chatLength) {
+    const exactSelectors = [
+        `.mes[mesid="${messageIndex}"]`,
+        `.mes[message_id="${messageIndex}"]`,
+        `.mes[data-message-id="${messageIndex}"]`,
+        `.mes[data-mes-id="${messageIndex}"]`,
+        `.mes[data-index="${messageIndex}"]`,
+    ];
+
+    for (const selector of exactSelectors) {
+        const element = document.querySelector(selector);
+        if (element) {
+            return element;
+        }
+    }
+
+    const visibleMessages = [...document.querySelectorAll('.mes')];
+    if (!visibleMessages.length) {
+        return null;
+    }
+
+    const offset = Number.isFinite(chatLength) && chatLength > visibleMessages.length
+        ? chatLength - visibleMessages.length
+        : 0;
+    const visibleIndex = messageIndex - offset;
+
+    if (visibleIndex >= 0 && visibleIndex < visibleMessages.length) {
+        return visibleMessages[visibleIndex];
+    }
+
+    return visibleMessages[messageIndex] ?? null;
+}
+
+function copyThemeToPipDocument(targetDocument) {
+    const themeVariables = collectThemeVariables(getComputedStyle(document.documentElement));
+    const css = buildThemeVariableCss(themeVariables);
+
+    if (!css) {
+        return;
+    }
+
+    const style = targetDocument.createElement('style');
+    style.dataset.pipMiniChatTheme = 'true';
+    style.textContent = css;
+    targetDocument.head.append(style);
+}
+
+function asPercent(value) {
+    return `${Math.round(clampNumber(value, 0, 1, 1) * 100)}%`;
+}
+
+function applyAppearanceSettings() {
+    const root = pipElements?.root;
+    if (!root || !pipWindow?.document) {
+        return;
+    }
+
+    const backgroundColor = appearanceSettings.useThemeBackground
+        ? 'var(--SmartThemeBlurTintColor, #171717)'
+        : appearanceSettings.backgroundColor;
+
+    root.style.setProperty('--pip-background-color', backgroundColor);
+    root.style.setProperty('--pip-background-opacity-percent', asPercent(appearanceSettings.backgroundOpacity));
+    root.style.setProperty('--pip-text-opacity-percent', asPercent(appearanceSettings.textOpacity));
+    root.style.setProperty('--pip-text-opacity', String(appearanceSettings.textOpacity));
+    root.style.setProperty('--pip-font-family', FONT_FAMILIES[appearanceSettings.fontFamily]);
+    root.style.setProperty('--pip-font-size', `${appearanceSettings.fontSize}px`);
+    root.style.setProperty('--pip-stealth-opacity', String(appearanceSettings.stealthOpacity));
+    root.dataset.stealthMode = String(appearanceSettings.stealthMode);
+    pipWindow.document.title = appearanceSettings.stealthMode ? 'Window' : 'PiP Mini Chat';
+}
+
+function buildPipDocument(targetWindow) {
+    const doc = targetWindow.document;
+    doc.title = appearanceSettings.stealthMode ? 'Window' : 'PiP Mini Chat';
+    doc.body.innerHTML = `
+        <main class="pip-mini-chat">
+            <header class="pip-mini-chat__header">
+                <div class="pip-mini-chat__title"></div>
+                <div class="pip-mini-chat__status" data-state="idle">Idle</div>
+            </header>
+            <div class="pip-mini-chat__scroll-wrap">
+                <section class="pip-mini-chat__output" aria-live="polite"></section>
+                <div class="pip-mini-chat__scrollbar" aria-hidden="true">
+                    <div class="pip-mini-chat__scroll-thumb"></div>
+                </div>
+            </div>
+            <textarea id="send_textarea" class="pip-mini-chat__input" rows="1" placeholder="Message"></textarea>
+            <div class="pip-mini-chat__actions">
+                <button class="pip-mini-chat__button pip-mini-chat__button--send" type="button">Send</button>
+                <button class="pip-mini-chat__button pip-mini-chat__button--regenerate" type="button">Retry</button>
+                <button class="pip-mini-chat__button pip-mini-chat__button--stop" type="button">Stop</button>
+            </div>
+        </main>
+    `;
+
+    const style = doc.createElement('style');
+    copyThemeToPipDocument(doc);
+    style.textContent = getPipStyles();
+    doc.head.append(style);
+
+    pipElements = {
+        root: doc.querySelector('.pip-mini-chat'),
+        title: doc.querySelector('.pip-mini-chat__title'),
+        status: doc.querySelector('.pip-mini-chat__status'),
+        output: doc.querySelector('.pip-mini-chat__output'),
+        scrollbar: doc.querySelector('.pip-mini-chat__scrollbar'),
+        scrollbarThumb: doc.querySelector('.pip-mini-chat__scroll-thumb'),
+        input: doc.querySelector('.pip-mini-chat__input'),
+        send: doc.querySelector('.pip-mini-chat__button--send'),
+        regenerate: doc.querySelector('.pip-mini-chat__button--regenerate'),
+        stop: doc.querySelector('.pip-mini-chat__button--stop'),
+    };
+
+    applyAppearanceSettings();
+    resizePipInput();
+    setupPipScrollbar();
+    installPipInteractionFallbacks();
+    pipElements.input.addEventListener('input', () => {
+        resizePipInput();
+        updateControls();
+    });
+    pipElements.input.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+            event.preventDefault();
+            void sendDraft();
+        }
+    });
+    pipElements.send.addEventListener('click', () => void sendDraft());
+    pipElements.regenerate.addEventListener('click', () => void regenerateLastMessage());
+    pipElements.stop.addEventListener('click', stopGeneration);
+}
+
+function resizePipInput() {
+    if (!pipElements?.input) {
+        return;
+    }
+
+    const rawLineCount = String(pipElements.input.value ?? '').split('\n').length;
+    const rowCount = getTextareaRowCount(pipElements.input.value);
+    const height = 16 + (rowCount * 20);
+
+    pipElements.input.rows = rowCount;
+    pipElements.input.style.height = `${height}px`;
+    pipElements.input.style.overflowY = rawLineCount > 3 ? 'auto' : 'hidden';
+}
+
+function setupPipScrollbar() {
+    if (!pipElements?.output || !pipElements?.scrollbar || !pipElements?.scrollbarThumb || !pipWindow) {
+        return;
+    }
+
+    let dragState = null;
+
+    pipElements.output.addEventListener('scroll', updatePipScrollbar);
+    pipWindow.addEventListener('resize', updatePipScrollbar);
+
+    const resizeObserver = new pipWindow.ResizeObserver(updatePipScrollbar);
+    resizeObserver.observe(pipElements.output);
+
+    const mutationObserver = new pipWindow.MutationObserver(updatePipScrollbar);
+    mutationObserver.observe(pipElements.output, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true,
+    });
+
+    pipElements.scrollbar.addEventListener('pointerdown', event => {
+        if (pipElements.scrollbar.dataset.visible !== 'true') {
+            return;
+        }
+
+        event.preventDefault();
+        const barRect = pipElements.scrollbar.getBoundingClientRect();
+        const thumbRect = pipElements.scrollbarThumb.getBoundingClientRect();
+        const clickedThumb = event.target === pipElements.scrollbarThumb;
+        const thumbOffset = clickedThumb
+            ? event.clientY - thumbRect.top
+            : thumbRect.height / 2;
+
+        dragState = {
+            pointerId: event.pointerId,
+            offsetY: thumbOffset,
+        };
+
+        pipElements.scrollbar.setPointerCapture?.(event.pointerId);
+        updateScrollFromThumbPosition(event.clientY - barRect.top - thumbOffset);
+    });
+
+    pipElements.scrollbar.addEventListener('pointermove', event => {
+        if (!dragState || event.pointerId !== dragState.pointerId) {
+            return;
+        }
+
+        event.preventDefault();
+        const barRect = pipElements.scrollbar.getBoundingClientRect();
+        updateScrollFromThumbPosition(event.clientY - barRect.top - dragState.offsetY);
+    });
+
+    pipElements.scrollbar.addEventListener('pointerup', event => {
+        if (!dragState || event.pointerId !== dragState.pointerId) {
+            return;
+        }
+
+        pipElements.scrollbar.releasePointerCapture?.(event.pointerId);
+        dragState = null;
+    });
+
+    pipWindow.addEventListener('pagehide', () => {
+        resizeObserver.disconnect();
+        mutationObserver.disconnect();
+    }, { once: true });
+
+    updatePipScrollbar();
+}
+
+function updateScrollFromThumbPosition(thumbTop) {
+    const output = pipElements?.output;
+    const scrollbar = pipElements?.scrollbar;
+    const thumb = pipElements?.scrollbarThumb;
+    if (!output || !scrollbar || !thumb) {
+        return;
+    }
+
+    const trackHeight = scrollbar.clientHeight;
+    const thumbHeight = thumb.offsetHeight;
+    const scrollRange = output.scrollHeight - output.clientHeight;
+    const thumbRange = Math.max(trackHeight - thumbHeight, 1);
+    const clampedTop = Math.min(Math.max(thumbTop, 0), thumbRange);
+    output.scrollTop = (clampedTop / thumbRange) * scrollRange;
+}
+
+function updatePipScrollbar() {
+    const output = pipElements?.output;
+    const scrollbar = pipElements?.scrollbar;
+    const thumb = pipElements?.scrollbarThumb;
+    if (!output || !scrollbar || !thumb) {
+        return;
+    }
+
+    const scrollHeight = output.scrollHeight;
+    const clientHeight = output.clientHeight;
+    const hasOverflow = scrollHeight > clientHeight + 1;
+    scrollbar.dataset.visible = String(hasOverflow);
+
+    if (!hasOverflow) {
+        thumb.style.height = '24px';
+        thumb.style.transform = 'translateY(0)';
+        return;
+    }
+
+    const trackHeight = scrollbar.clientHeight;
+    const thumbHeight = Math.max(24, Math.round((clientHeight / scrollHeight) * trackHeight));
+    const thumbRange = Math.max(trackHeight - thumbHeight, 1);
+    const scrollRange = Math.max(scrollHeight - clientHeight, 1);
+    const top = Math.round((output.scrollTop / scrollRange) * thumbRange);
+
+    thumb.style.height = `${thumbHeight}px`;
+    thumb.style.transform = `translateY(${top}px)`;
+}
+
+function createPipJQueryBridge(hostJQuery) {
+    const pipDocument = pipWindow?.document;
+    if (typeof hostJQuery !== 'function' || !pipDocument) {
+        return hostJQuery;
+    }
+
+    const bridge = function pipJQueryBridge(selector, context) {
+        if (typeof selector === 'function') {
+            if (pipDocument.readyState === 'loading') {
+                pipDocument.addEventListener('DOMContentLoaded', () => selector(bridge), { once: true });
+            } else {
+                selector(bridge);
+            }
+            return hostJQuery(pipDocument);
+        }
+
+        if (typeof selector === 'string' && context === undefined) {
+            return hostJQuery(selector, pipDocument);
+        }
+
+        return hostJQuery(selector, context);
+    };
+
+    Object.setPrototypeOf(bridge, Object.getPrototypeOf(hostJQuery));
+    Object.assign(bridge, hostJQuery);
+    bridge.fn = hostJQuery.fn;
+
+    return bridge;
+}
+
+function bridgeHostGlobalsToPipWindow() {
+    if (!pipWindow || pipWindow.closed) {
+        return;
+    }
+
+    const hostJQuery = globalThis.jQuery ?? globalThis.$;
+    if (typeof hostJQuery === 'function') {
+        const pipJQuery = createPipJQueryBridge(hostJQuery);
+        pipWindow.$ = pipJQuery;
+        pipWindow.jQuery = pipJQuery;
+    }
+
+    pipWindow.setPipMiniChatInput = text => writePipInput(text, { append: false });
+    pipWindow.appendPipMiniChatInput = text => writePipInput(text, { append: true });
+    pipWindow.triggerSlash = command => {
+        const inputMatch = String(command ?? '').match(/^\/setinput\s+([\s\S]*)$/i);
+        if (inputMatch) {
+            writePipInput(inputMatch[1], { append: false });
+            return true;
+        }
+
+        return globalThis.triggerSlash?.(command);
+    };
+
+    const names = [
+        '_',
+        'toastr',
+        'SillyTavern',
+        'TavernHelper',
+        'Mvu',
+        'getAllVariables',
+        'waitGlobalInitialized',
+        'eventOn',
+        'eventMakeLast',
+        'eventSource',
+        'eventTypes',
+        'errorCatched',
+    ];
+
+    for (const name of names) {
+        if (globalThis[name] !== undefined) {
+            try {
+                pipWindow[name] = globalThis[name];
+            } catch {
+                // Best-effort compatibility bridge for user-provided status HTML.
+            }
+        }
+    }
+}
+
+function executeOutputScripts(container) {
+    const scripts = container?.querySelectorAll?.('script') ?? [];
+
+    withPipDocumentCompatibility(() => {
+        for (const script of scripts) {
+            const replacement = pipWindow.document.createElement('script');
+            for (const attribute of script.attributes) {
+                replacement.setAttribute(attribute.name, attribute.value);
+            }
+            replacement.textContent = script.textContent;
+            script.replaceWith(replacement);
+        }
+    });
+}
+
+function withPipDocumentCompatibility(callback) {
+    if (!pipWindow?.document || typeof callback !== 'function') {
+        return;
+    }
+
+    const doc = pipWindow.document;
+    const originalAddEventListener = doc.addEventListener.bind(doc);
+    const originalWindowAddEventListener = pipWindow.addEventListener.bind(pipWindow);
+
+    const makeDomReadyCompat = original => function addEventListenerCompat(type, listener, options) {
+        if (type === 'DOMContentLoaded' && doc.readyState !== 'loading' && typeof listener === 'function') {
+            pipWindow.setTimeout(() => {
+                listener.call(doc, new Event('DOMContentLoaded'));
+            }, 0);
+        }
+
+        return original(type, listener, options);
+    };
+
+    doc.addEventListener = makeDomReadyCompat(originalAddEventListener);
+    pipWindow.addEventListener = makeDomReadyCompat(originalWindowAddEventListener);
+
+    try {
+        callback();
+    } finally {
+        doc.addEventListener = originalAddEventListener;
+        pipWindow.addEventListener = originalWindowAddEventListener;
+    }
+}
+
+function installPipInteractionFallbacks() {
+    if (!pipElements?.output) {
+        return;
+    }
+
+    pipElements.output.addEventListener('click', event => {
+        const target = event.target?.closest?.('[data-pip-input], .option-item');
+        if (!target) {
+            return;
+        }
+
+        const valueBeforeClick = pipElements.input.value;
+        pipWindow.setTimeout(() => {
+            if (pipElements.input.value !== valueBeforeClick) {
+                return;
+            }
+
+            const text = target.dataset.pipInput || target.querySelector?.('.option-text')?.textContent || target.textContent;
+            if (text?.trim()) {
+                writePipInput(text.trim(), { append: true });
+            }
+        }, 0);
+    });
+}
+
+function cleanupPip() {
+    cleanupPipEventListeners?.();
+    cleanupPipEventListeners = null;
+    pipWindow = null;
+    pipElements = null;
+    isGenerating = false;
+    lastRenderedOutputHtml = '';
+}
+
+async function openPipWindow() {
+    if (!window.documentPictureInPicture?.requestWindow) {
+        notifyError('Document Picture-in-Picture is unavailable. Please use Chrome or Edge.');
+        return;
+    }
+
+    if (pipWindow && !pipWindow.closed) {
+        pipWindow.focus();
+        return;
+    }
+
+    try {
+        pipWindow = await window.documentPictureInPicture.requestWindow({
+            width: PIP_WIDTH,
+            height: PIP_HEIGHT,
+        });
+        isGenerating = false;
+        buildPipDocument(pipWindow);
+        void loadSillyTavernStatusHelpers().then(() => {
+            syncGenerationState();
+            refreshPip();
+        });
+        registerPipEventListeners();
+        pipWindow.addEventListener('pagehide', cleanupPip, { once: true });
+        refreshPip();
+        pipElements.input.focus();
+    } catch (error) {
+        cleanupPip();
+        notifyError(error?.message ?? 'Could not open PiP window', error);
+    }
+}
+
+function closePipWindow() {
+    if (!shouldClosePipWindow(pipWindow)) {
+        cleanupPip();
+        return;
+    }
+
+    const windowToClose = pipWindow;
+    cleanupPip();
+    windowToClose.close();
+}
+
+async function togglePipWindow() {
+    if (shouldClosePipWindow(pipWindow)) {
+        closePipWindow();
+        return;
+    }
+
+    await openPipWindow();
+}
+
+function createLauncherButton({ id, variant }) {
+    const button = document.createElement('div');
+    button.id = id;
+    button.className = variant === 'menu'
+        ? 'list-group-item flex-container flexGap5 interactable pip-mini-chat-menu-launcher'
+        : 'pip-mini-chat-floating-launcher interactable';
+    button.tabIndex = 0;
+    button.role = 'button';
+    button.title = 'Open small window mode';
+    button.innerHTML = variant === 'menu'
+        ? `${getLauncherIcon()}<span>小窗模式</span>`
+        : getLauncherIcon();
+    button.addEventListener('click', event => {
+        if (button.dataset.dragMoved === 'true') {
+            event.preventDefault();
+            button.dataset.dragMoved = 'false';
+            return;
+        }
+
+        void togglePipWindow();
+    });
+    button.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            void togglePipWindow();
+        }
+    });
+
+    if (variant === 'floating') {
+        restoreFloatingLauncherPosition(button);
+        enableFloatingLauncherDrag(button);
+    }
+
+    return button;
+}
+
+function getLauncherIcon() {
+    return `
+        <svg class="pip-mini-chat-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+            <rect x="12" y="11" width="6" height="4" rx="1"></rect>
+        </svg>
+    `;
+}
+
+function getStoredFloatingPosition() {
+    try {
+        const raw = localStorage.getItem(FLOATING_POSITION_KEY);
+        return raw ? JSON.parse(raw) : null;
+    } catch {
+        return null;
+    }
+}
+
+function storeFloatingPosition(position) {
+    try {
+        localStorage.setItem(FLOATING_POSITION_KEY, JSON.stringify(position));
+    } catch {
+        // Position persistence is a convenience only.
+    }
+}
+
+function getFloatingLauncherSize(button) {
+    const rect = button.getBoundingClientRect();
+    return {
+        width: rect.width || 44,
+        height: rect.height || 36,
+    };
+}
+
+function applyFloatingLauncherPosition(button, position) {
+    button.style.left = `${position.left}px`;
+    button.style.top = `${position.top}px`;
+    button.style.right = 'auto';
+    button.style.bottom = 'auto';
+}
+
+function restoreFloatingLauncherPosition(button) {
+    const stored = getStoredFloatingPosition();
+    if (!stored || !Number.isFinite(stored.left) || !Number.isFinite(stored.top)) {
+        return;
+    }
+
+    const size = getFloatingLauncherSize(button);
+    applyFloatingLauncherPosition(button, normalizeFloatingPosition({
+        left: stored.left,
+        top: stored.top,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        elementWidth: size.width,
+        elementHeight: size.height,
+        margin: FLOATING_DRAG_MARGIN,
+    }));
+}
+
+function enableFloatingLauncherDrag(button) {
+    let dragState = null;
+
+    button.addEventListener('pointerdown', event => {
+        if (event.button !== 0) {
+            return;
+        }
+
+        const rect = button.getBoundingClientRect();
+        dragState = {
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            left: rect.left,
+            top: rect.top,
+            moved: false,
+        };
+        button.setPointerCapture?.(event.pointerId);
+    });
+
+    button.addEventListener('pointermove', event => {
+        if (!dragState || event.pointerId !== dragState.pointerId) {
+            return;
+        }
+
+        const deltaX = event.clientX - dragState.startX;
+        const deltaY = event.clientY - dragState.startY;
+        if (Math.abs(deltaX) + Math.abs(deltaY) > 4) {
+            dragState.moved = true;
+        }
+
+        const size = getFloatingLauncherSize(button);
+        const position = normalizeFloatingPosition({
+            left: dragState.left + deltaX,
+            top: dragState.top + deltaY,
+            viewportWidth: window.innerWidth,
+            viewportHeight: window.innerHeight,
+            elementWidth: size.width,
+            elementHeight: size.height,
+            margin: FLOATING_DRAG_MARGIN,
+        });
+        applyFloatingLauncherPosition(button, position);
+    });
+
+    button.addEventListener('pointerup', event => {
+        if (!dragState || event.pointerId !== dragState.pointerId) {
+            return;
+        }
+
+        button.releasePointerCapture?.(event.pointerId);
+        const position = {
+            left: button.getBoundingClientRect().left,
+            top: button.getBoundingClientRect().top,
+        };
+        storeFloatingPosition(position);
+
+        if (dragState.moved) {
+            button.dataset.dragMoved = 'true';
+            window.setTimeout(() => {
+                button.dataset.dragMoved = 'false';
+            }, 150);
+        }
+
+        dragState = null;
+    });
+
+    window.addEventListener('resize', () => restoreFloatingLauncherPosition(button));
+}
+
+function registerLauncher() {
+    for (const target of getLauncherTargets(document)) {
+        if (document.getElementById(target.id)) {
+            continue;
+        }
+
+        target.host.append(createLauncherButton(target));
+    }
+}
+
+function setCompatibleSendMode(enabled) {
+    compatibleSendMode = Boolean(enabled);
+    writeBooleanSetting({
+        storage: globalThis.localStorage,
+        key: COMPATIBLE_SEND_MODE_KEY,
+        value: compatibleSendMode,
+    });
+}
+
+function syncAppearanceSettingsPanel(panel = document.getElementById('pip-mini-chat-settings')) {
+    if (!panel) {
+        return;
+    }
+
+    const useThemeBackground = panel.querySelector('#pip-mini-chat-use-theme-background');
+    const backgroundColor = panel.querySelector('#pip-mini-chat-background-color');
+    const backgroundOpacity = panel.querySelector('#pip-mini-chat-background-opacity');
+    const fontFamily = panel.querySelector('#pip-mini-chat-font-family');
+    const fontSize = panel.querySelector('#pip-mini-chat-font-size');
+    const textOpacity = panel.querySelector('#pip-mini-chat-text-opacity');
+    const stealthMode = panel.querySelector('#pip-mini-chat-stealth-mode');
+    const stealthOpacity = panel.querySelector('#pip-mini-chat-stealth-opacity');
+
+    useThemeBackground.checked = appearanceSettings.useThemeBackground;
+    backgroundColor.value = appearanceSettings.backgroundColor;
+    backgroundColor.disabled = appearanceSettings.useThemeBackground;
+    backgroundOpacity.value = String(Math.round(appearanceSettings.backgroundOpacity * 100));
+    panel.querySelector('[data-value-for="pip-mini-chat-background-opacity"]').textContent = asPercent(appearanceSettings.backgroundOpacity);
+    fontFamily.value = appearanceSettings.fontFamily;
+    fontSize.value = String(appearanceSettings.fontSize);
+    panel.querySelector('[data-value-for="pip-mini-chat-font-size"]').textContent = `${appearanceSettings.fontSize}px`;
+    textOpacity.value = String(Math.round(appearanceSettings.textOpacity * 100));
+    panel.querySelector('[data-value-for="pip-mini-chat-text-opacity"]').textContent = asPercent(appearanceSettings.textOpacity);
+    stealthMode.checked = appearanceSettings.stealthMode;
+    stealthOpacity.value = String(Math.round(appearanceSettings.stealthOpacity * 100));
+    stealthOpacity.disabled = !appearanceSettings.stealthMode;
+    panel.querySelector('[data-value-for="pip-mini-chat-stealth-opacity"]').textContent = asPercent(appearanceSettings.stealthOpacity);
+}
+
+function registerSettingsPanel() {
+    if (document.getElementById('pip-mini-chat-settings')) {
+        return;
+    }
+
+    const host = document.querySelector('#extensions_settings');
+    if (!host) {
+        return;
+    }
+
+    const panel = document.createElement('div');
+    panel.id = 'pip-mini-chat-settings';
+    panel.innerHTML = `
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>小窗模式</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <div class="pip-mini-chat-settings__section">
+                    <div class="pip-mini-chat-settings__section-title">小窗外观</div>
+
+                    <label class="checkbox_label pip-mini-chat-settings__row" for="pip-mini-chat-use-theme-background">
+                        <input id="pip-mini-chat-use-theme-background" type="checkbox" class="checkbox">
+                        <span>背景色跟随酒馆主题</span>
+                    </label>
+
+                    <label class="pip-mini-chat-settings__field" for="pip-mini-chat-background-color">
+                        <span>自定义背景色</span>
+                        <input id="pip-mini-chat-background-color" type="color" value="#171717">
+                    </label>
+
+                    <label class="pip-mini-chat-settings__slider" for="pip-mini-chat-background-opacity">
+                        <span>背景不透明度</span>
+                        <output data-value-for="pip-mini-chat-background-opacity">100%</output>
+                        <input id="pip-mini-chat-background-opacity" type="range" min="10" max="100" step="5">
+                    </label>
+
+                    <label class="pip-mini-chat-settings__field" for="pip-mini-chat-font-family">
+                        <span>字体</span>
+                        <select id="pip-mini-chat-font-family" class="text_pole">
+                            <option value="system">系统界面字体</option>
+                            <option value="sans">微软雅黑 / 无衬线</option>
+                            <option value="serif">宋体 / 衬线</option>
+                            <option value="kai">楷体</option>
+                            <option value="mono">等宽字体</option>
+                        </select>
+                    </label>
+
+                    <label class="pip-mini-chat-settings__slider" for="pip-mini-chat-font-size">
+                        <span>字号</span>
+                        <output data-value-for="pip-mini-chat-font-size">14px</output>
+                        <input id="pip-mini-chat-font-size" type="range" min="10" max="24" step="1">
+                    </label>
+
+                    <label class="pip-mini-chat-settings__slider" for="pip-mini-chat-text-opacity">
+                        <span>文字不透明度</span>
+                        <output data-value-for="pip-mini-chat-text-opacity">100%</output>
+                        <input id="pip-mini-chat-text-opacity" type="range" min="10" max="100" step="5">
+                    </label>
+                    <small class="pip-mini-chat-settings__hint">不透明度越低，背景或文字就越透明。</small>
+                </div>
+
+                <div class="pip-mini-chat-settings__section">
+                    <div class="pip-mini-chat-settings__section-title">隐蔽模式</div>
+                    <label class="checkbox_label pip-mini-chat-settings__row" for="pip-mini-chat-stealth-mode">
+                        <input id="pip-mini-chat-stealth-mode" type="checkbox" class="checkbox">
+                        <span>开启隐蔽模式</span>
+                    </label>
+                    <small class="pip-mini-chat-settings__hint">
+                        鼠标移出小窗后淡化内容并收起标题、输入框和按钮；移入小窗或聚焦输入框后恢复显示。
+                    </small>
+                    <label class="pip-mini-chat-settings__slider" for="pip-mini-chat-stealth-opacity">
+                        <span>隐蔽时可见度</span>
+                        <output data-value-for="pip-mini-chat-stealth-opacity">18%</output>
+                        <input id="pip-mini-chat-stealth-opacity" type="range" min="5" max="60" step="1">
+                    </label>
+                </div>
+
+                <button id="pip-mini-chat-reset-appearance" type="button" class="menu_button pip-mini-chat-settings__reset">
+                    恢复默认外观
+                </button>
+
+                <div class="pip-mini-chat-settings__section pip-mini-chat-settings__section--compatibility">
+                    <div class="pip-mini-chat-settings__section-title">兼容性</div>
+                    <label class="checkbox_label pip-mini-chat-settings__row" for="pip-mini-chat-compatible-send-mode">
+                        <input id="pip-mini-chat-compatible-send-mode" type="checkbox" class="checkbox">
+                        <span>兼容发送拦截插件</span>
+                    </label>
+                    <small class="pip-mini-chat-settings__hint">
+                        开启后，小窗发送前会向主页面发送按钮发出一次发送意图信号，用于兼容数据库、剧情规划等拦截脚本。
+                    </small>
+                </div>
+            </div>
+        </div>
+    `;
+
+    const compatibleCheckbox = panel.querySelector('#pip-mini-chat-compatible-send-mode');
+    compatibleCheckbox.checked = compatibleSendMode;
+    compatibleCheckbox.addEventListener('change', () => {
+        setCompatibleSendMode(compatibleCheckbox.checked);
+    });
+
+    panel.querySelector('#pip-mini-chat-use-theme-background').addEventListener('change', event => {
+        updateAppearanceSettings({ useThemeBackground: event.currentTarget.checked });
+    });
+    panel.querySelector('#pip-mini-chat-background-color').addEventListener('input', event => {
+        updateAppearanceSettings({ backgroundColor: event.currentTarget.value });
+    });
+    panel.querySelector('#pip-mini-chat-background-opacity').addEventListener('input', event => {
+        updateAppearanceSettings({ backgroundOpacity: Number(event.currentTarget.value) / 100 });
+    });
+    panel.querySelector('#pip-mini-chat-font-family').addEventListener('change', event => {
+        updateAppearanceSettings({ fontFamily: event.currentTarget.value });
+    });
+    panel.querySelector('#pip-mini-chat-font-size').addEventListener('input', event => {
+        updateAppearanceSettings({ fontSize: Number(event.currentTarget.value) });
+    });
+    panel.querySelector('#pip-mini-chat-text-opacity').addEventListener('input', event => {
+        updateAppearanceSettings({ textOpacity: Number(event.currentTarget.value) / 100 });
+    });
+    panel.querySelector('#pip-mini-chat-stealth-mode').addEventListener('change', event => {
+        updateAppearanceSettings({ stealthMode: event.currentTarget.checked });
+    });
+    panel.querySelector('#pip-mini-chat-stealth-opacity').addEventListener('input', event => {
+        updateAppearanceSettings({ stealthOpacity: Number(event.currentTarget.value) / 100 });
+    });
+    panel.querySelector('#pip-mini-chat-reset-appearance').addEventListener('click', () => {
+        appearanceSettings = { ...DEFAULT_APPEARANCE_SETTINGS };
+        writeAppearanceSettings();
+        applyAppearanceSettings();
+        syncAppearanceSettingsPanel(panel);
+    });
+
+    syncAppearanceSettingsPanel(panel);
+    host.append(panel);
+}
+
+function startLauncherRetry() {
+    if (launcherRetryTimer) {
+        return;
+    }
+
+    launcherRetryTimer = window.setInterval(() => {
+        registerSettingsPanel();
+        registerLauncher();
+        launcherRetryCount += 1;
+
+        if (
+            (document.getElementById('pip-mini-chat-menu-open') && document.getElementById('pip-mini-chat-settings')) ||
+            launcherRetryCount >= LAUNCHER_RETRY_LIMIT
+        ) {
+            window.clearInterval(launcherRetryTimer);
+            launcherRetryTimer = null;
+        }
+    }, 500);
+}
+
+function handleEvent(eventName) {
+    if (eventName === 'generation_started') {
+        isGenerating = true;
+    }
+
+    if (eventName === 'generation_stopped' || eventName === 'generation_ended') {
+        isGenerating = false;
+    }
+
+    syncGenerationState();
+    refreshPip();
+}
+
+function registerPipEventListeners() {
+    cleanupPipEventListeners?.();
+
+    const context = getContext();
+    const eventSource = context?.eventSource;
+    if (!eventSource?.on) {
+        return;
+    }
+
+    cleanupPipEventListeners = bindEventHandlers({
+        eventSource,
+        eventNames: buildEventList({ eventTypes: getEventTypes(context) }),
+        onEvent: handleEvent,
+    });
+}
+
+function init() {
+    registerSettingsPanel();
+    registerLauncher();
+    startLauncherRetry();
+}
+
+const context = getContext();
+const eventTypes = getEventTypes(context);
+if (context?.eventSource?.on) {
+    context.eventSource.on(eventTypes.APP_READY ?? 'app_ready', init);
+} else if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+} else {
+    init();
+}
