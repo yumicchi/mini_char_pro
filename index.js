@@ -15,6 +15,14 @@ import {
     triggerRegenerate,
     writeBooleanSetting,
 } from './core.js';
+import {
+    DEFAULT_DESKTOP_BRIDGE_SETTINGS,
+    DESKTOP_BRIDGE_SETTINGS_KEY,
+    DesktopBridge,
+    getDesktopBridgeStatusText,
+    normalizeDesktopBridgeSettings,
+    parseDesktopBridgeConfiguration,
+} from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
 const PIP_WIDTH = 380;
@@ -50,12 +58,20 @@ let cleanupPipEventListeners = null;
 let launcherRetryCount = 0;
 let launcherRetryTimer = null;
 let lastRenderedOutputHtml = '';
+let desktopBridge = null;
+let desktopBridgeStatus = {
+    state: 'disabled',
+    detail: '',
+};
+let desktopMutationObserver = null;
+let desktopObservedChat = null;
 let compatibleSendMode = readBooleanSetting({
     storage: globalThis.localStorage,
     key: COMPATIBLE_SEND_MODE_KEY,
     fallback: false,
 });
 let appearanceSettings = readAppearanceSettings();
+let desktopBridgeSettings = readDesktopBridgeSettings();
 
 function getContext() {
     return globalThis.SillyTavern?.getContext?.();
@@ -112,6 +128,42 @@ function writeAppearanceSettings() {
     } catch {
         // Appearance persistence is optional when storage is unavailable.
     }
+}
+
+function readDesktopBridgeSettings() {
+    try {
+        const raw = globalThis.localStorage?.getItem?.(DESKTOP_BRIDGE_SETTINGS_KEY);
+        return normalizeDesktopBridgeSettings(
+            raw ? JSON.parse(raw) : DEFAULT_DESKTOP_BRIDGE_SETTINGS,
+        );
+    } catch {
+        return { ...DEFAULT_DESKTOP_BRIDGE_SETTINGS };
+    }
+}
+
+function writeDesktopBridgeSettings() {
+    try {
+        globalThis.localStorage?.setItem?.(
+            DESKTOP_BRIDGE_SETTINGS_KEY,
+            JSON.stringify(desktopBridgeSettings),
+        );
+    } catch {
+        // Desktop bridge persistence is optional when storage is unavailable.
+    }
+}
+
+function updateDesktopBridgeSettings(patch) {
+    desktopBridgeSettings = normalizeDesktopBridgeSettings({
+        ...desktopBridgeSettings,
+        ...patch,
+    });
+    writeDesktopBridgeSettings();
+    desktopBridge?.setSettings(desktopBridgeSettings);
+    if (desktopBridgeSettings.enabled) {
+        registerPipEventListeners();
+        installDesktopMutationObserver();
+    }
+    syncDesktopBridgeSettingsPanel();
 }
 
 function updateAppearanceSettings(patch) {
@@ -241,23 +293,27 @@ function syncGenerationState() {
     });
 }
 
+async function sendTextToSillyTavern(text) {
+    const sendMessage = await loadSendTextareaMessage();
+    const textarea = document.querySelector('#send_textarea');
+    const sendButton = compatibleSendMode ? document.querySelector('#send_but') : null;
+    await sendDraftToSillyTavern({
+        text,
+        textarea,
+        inputEventFactory: () => new Event('input', { bubbles: true }),
+        sendTextareaMessage: sendMessage,
+        compatibleIntentTarget: sendButton,
+        compatibleIntentEventFactory: createCompatibleSendIntentEvent,
+    });
+}
+
 async function sendDraft() {
     if (!pipElements) {
         return;
     }
 
     try {
-        const sendMessage = await loadSendTextareaMessage();
-        const textarea = document.querySelector('#send_textarea');
-        const sendButton = compatibleSendMode ? document.querySelector('#send_but') : null;
-        await sendDraftToSillyTavern({
-            text: pipElements.input.value,
-            textarea,
-            inputEventFactory: () => new Event('input', { bubbles: true }),
-            sendTextareaMessage: sendMessage,
-            compatibleIntentTarget: sendButton,
-            compatibleIntentEventFactory: createCompatibleSendIntentEvent,
-        });
+        await sendTextToSillyTavern(pipElements.input.value);
         pipElements.input.value = '';
         resizePipInput();
         setStatus('Sent', 'idle');
@@ -670,6 +726,155 @@ function findRenderedMessageElement(messageIndex, chatLength) {
     return visibleMessages[messageIndex] ?? null;
 }
 
+function getDesktopRenderPayload() {
+    syncGenerationState();
+    const context = getContext();
+    const latest = findLatestAssistantMessage(context?.chat);
+    const html = getRenderedLatestAssistantHtml(context) ?? formatLatestAssistantMessage({
+        chat: context?.chat,
+        formatter: context?.messageFormatting,
+    });
+
+    return {
+        title: getTitle(context),
+        html,
+        text: String(latest?.message?.mes ?? ''),
+        streaming: isGenerating,
+        themeVariables: collectThemeVariables(getComputedStyle(document.documentElement)),
+    };
+}
+
+function normalizeInteractionText(value) {
+    return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function findDesktopInteractionTarget(payload = {}) {
+    const context = getContext();
+    const latest = findLatestAssistantMessage(context?.chat);
+    if (!latest) {
+        return null;
+    }
+
+    const messageElement = findRenderedMessageElement(latest.index, context?.chat?.length);
+    const root = messageElement?.querySelector?.('.mes_text') ?? messageElement;
+    if (!root) {
+        return null;
+    }
+
+    if (payload.id) {
+        const exact = document.getElementById(String(payload.id));
+        if (exact && root.contains(exact)) {
+            return exact;
+        }
+    }
+
+    const expectedText = normalizeInteractionText(payload.text);
+    const expectedValue = normalizeInteractionText(payload.value);
+    const expectedAction = normalizeInteractionText(payload.action);
+    const candidates = root.querySelectorAll(
+        '[data-veil-action], [data-pip-input], [data-option], .option-item, button',
+    );
+
+    for (const candidate of candidates) {
+        const values = [
+            candidate.dataset?.veilAction,
+            candidate.dataset?.pipInput,
+            candidate.dataset?.option,
+            candidate.dataset?.value,
+            candidate.querySelector?.('.option-text')?.textContent,
+            candidate.textContent,
+        ].map(normalizeInteractionText);
+
+        if (
+            (expectedAction && values.includes(expectedAction))
+            || (expectedValue && values.includes(expectedValue))
+            || (expectedText && values.includes(expectedText))
+        ) {
+            return candidate;
+        }
+    }
+
+    return null;
+}
+
+function handleDesktopInteraction(payload = {}) {
+    const target = findDesktopInteractionTarget(payload);
+    if (target) {
+        target.click();
+        return true;
+    }
+
+    const text = String(payload.text ?? '').trim();
+    const textarea = document.querySelector('#send_textarea');
+    if (!text || !textarea) {
+        return false;
+    }
+
+    textarea.value = String(textarea.value ?? '') + text;
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    textarea.focus();
+    return true;
+}
+
+async function handleDesktopBridgeAction(message) {
+    if (message.type === 'composer:send') {
+        await sendTextToSillyTavern(String(message.payload?.text ?? ''));
+        return;
+    }
+    if (message.type === 'generation:retry') {
+        await regenerateLastMessage();
+        return;
+    }
+    if (message.type === 'generation:stop') {
+        stopGeneration();
+        return;
+    }
+    if (message.type === 'interaction:select') {
+        handleDesktopInteraction(message.payload);
+    }
+}
+
+function initializeDesktopBridge() {
+    if (desktopBridge) {
+        desktopBridge.setSettings(desktopBridgeSettings);
+        return;
+    }
+
+    desktopBridge = new DesktopBridge({
+        settings: desktopBridgeSettings,
+        getRenderPayload: getDesktopRenderPayload,
+        getGenerationState: () => {
+            syncGenerationState();
+            return isGenerating;
+        },
+        onAction: handleDesktopBridgeAction,
+        onStatus: status => {
+            desktopBridgeStatus = status;
+            syncDesktopBridgeSettingsPanel();
+        },
+    });
+    desktopBridge.start();
+}
+
+function installDesktopMutationObserver() {
+    const chat = document.querySelector('#chat');
+    if (!chat || chat === desktopObservedChat) {
+        return;
+    }
+
+    desktopMutationObserver?.disconnect();
+    desktopObservedChat = chat;
+    desktopMutationObserver = new MutationObserver(() => {
+        desktopBridge?.scheduleSync(120);
+    });
+    desktopMutationObserver.observe(chat, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+    });
+}
+
 function copyThemeToPipDocument(targetDocument) {
     const themeVariables = collectThemeVariables(getComputedStyle(document.documentElement));
     const css = buildThemeVariableCss(themeVariables);
@@ -1050,8 +1255,6 @@ function installPipInteractionFallbacks() {
 }
 
 function cleanupPip() {
-    cleanupPipEventListeners?.();
-    cleanupPipEventListeners = null;
     pipWindow = null;
     pipElements = null;
     isGenerating = false;
@@ -1319,6 +1522,30 @@ function syncAppearanceSettingsPanel(panel = document.getElementById('pip-mini-c
     stealthMode.checked = appearanceSettings.stealthMode;
 }
 
+function syncDesktopBridgeSettingsPanel(panel = document.getElementById('pip-mini-chat-settings')) {
+    if (!panel) {
+        return;
+    }
+
+    const enabled = panel.querySelector('#pip-mini-chat-desktop-enabled');
+    const url = panel.querySelector('#pip-mini-chat-desktop-url');
+    const token = panel.querySelector('#pip-mini-chat-desktop-token');
+    const status = panel.querySelector('#pip-mini-chat-desktop-status');
+    if (!enabled || !url || !token || !status) {
+        return;
+    }
+
+    enabled.checked = desktopBridgeSettings.enabled;
+    url.value = desktopBridgeSettings.url;
+    token.value = desktopBridgeSettings.token;
+    status.dataset.state = desktopBridgeStatus.state;
+
+    const label = getDesktopBridgeStatusText(desktopBridgeStatus);
+    status.textContent = desktopBridgeStatus.detail
+        ? label + '：' + desktopBridgeStatus.detail
+        : label;
+}
+
 function registerSettingsPanel() {
     if (document.getElementById('pip-mini-chat-settings')) {
         return;
@@ -1413,6 +1640,41 @@ function registerSettingsPanel() {
                         开启后，小窗发送前会向主页面发送按钮发出一次发送意图信号，用于兼容数据库、剧情规划等拦截脚本。
                     </small>
                 </div>
+
+                <div class="pip-mini-chat-settings__section pip-mini-chat-settings__section--desktop">
+                    <div class="pip-mini-chat-settings__section-title">隐窗伴侣</div>
+                    <label class="checkbox_label pip-mini-chat-settings__row" for="pip-mini-chat-desktop-enabled">
+                        <input id="pip-mini-chat-desktop-enabled" type="checkbox" class="checkbox">
+                        <span>启用桌面伴侣通信</span>
+                    </label>
+                    <div class="pip-mini-chat-settings__desktop-status">
+                        状态：<span id="pip-mini-chat-desktop-status" data-state="disabled">未启用</span>
+                    </div>
+                    <label class="pip-mini-chat-settings__field pip-mini-chat-settings__field--stacked" for="pip-mini-chat-desktop-url">
+                        <span>本机连接地址</span>
+                        <input id="pip-mini-chat-desktop-url" type="text" class="text_pole" autocomplete="off">
+                    </label>
+                    <label class="pip-mini-chat-settings__field pip-mini-chat-settings__field--stacked" for="pip-mini-chat-desktop-token">
+                        <span>连接令牌</span>
+                        <input id="pip-mini-chat-desktop-token" type="password" class="text_pole" autocomplete="off">
+                    </label>
+                    <label class="pip-mini-chat-settings__field pip-mini-chat-settings__field--stacked" for="pip-mini-chat-desktop-config-import">
+                        <span>快速导入</span>
+                        <textarea
+                            id="pip-mini-chat-desktop-config-import"
+                            class="text_pole"
+                            rows="3"
+                            placeholder="粘贴隐窗伴侣中“复制配置”的内容"
+                        ></textarea>
+                    </label>
+                    <div class="pip-mini-chat-settings__desktop-actions">
+                        <button id="pip-mini-chat-desktop-apply-config" type="button" class="menu_button">应用连接配置</button>
+                        <button id="pip-mini-chat-desktop-reconnect" type="button" class="menu_button">重新连接</button>
+                    </div>
+                    <small class="pip-mini-chat-settings__hint">
+                        隐窗伴侣需要先启动。通信仅允许 127.0.0.1、localhost 或本机 IPv6 回环地址。
+                    </small>
+                </div>
             </div>
         </div>
     `;
@@ -1421,6 +1683,37 @@ function registerSettingsPanel() {
     compatibleCheckbox.checked = compatibleSendMode;
     compatibleCheckbox.addEventListener('change', () => {
         setCompatibleSendMode(compatibleCheckbox.checked);
+    });
+
+    const desktopEnabled = panel.querySelector('#pip-mini-chat-desktop-enabled');
+    const desktopUrl = panel.querySelector('#pip-mini-chat-desktop-url');
+    const desktopToken = panel.querySelector('#pip-mini-chat-desktop-token');
+    const desktopConfigImport = panel.querySelector('#pip-mini-chat-desktop-config-import');
+
+    desktopEnabled.addEventListener('change', () => {
+        updateDesktopBridgeSettings({ enabled: desktopEnabled.checked });
+    });
+    desktopUrl.addEventListener('change', () => {
+        updateDesktopBridgeSettings({ url: desktopUrl.value });
+    });
+    desktopToken.addEventListener('change', () => {
+        updateDesktopBridgeSettings({ token: desktopToken.value });
+    });
+    panel.querySelector('#pip-mini-chat-desktop-apply-config').addEventListener('click', () => {
+        try {
+            const settings = parseDesktopBridgeConfiguration(
+                desktopConfigImport.value,
+                desktopBridgeSettings,
+            );
+            updateDesktopBridgeSettings(settings);
+            desktopConfigImport.value = '';
+            globalThis.toastr?.success?.('隐窗伴侣连接配置已应用。', '隐蔽小窗');
+        } catch (error) {
+            globalThis.toastr?.error?.(error.message, '隐蔽小窗');
+        }
+    });
+    panel.querySelector('#pip-mini-chat-desktop-reconnect').addEventListener('click', () => {
+        desktopBridge?.connect();
     });
 
     panel.querySelector('#pip-mini-chat-use-theme-background').addEventListener('change', event => {
@@ -1452,6 +1745,7 @@ function registerSettingsPanel() {
     });
 
     syncAppearanceSettingsPanel(panel);
+    syncDesktopBridgeSettingsPanel(panel);
     host.append(panel);
 }
 
@@ -1463,6 +1757,7 @@ function startLauncherRetry() {
     launcherRetryTimer = window.setInterval(() => {
         registerSettingsPanel();
         registerLauncher();
+        installDesktopMutationObserver();
         launcherRetryCount += 1;
 
         if (
@@ -1486,6 +1781,8 @@ function handleEvent(eventName) {
 
     syncGenerationState();
     refreshPip();
+    desktopBridge?.sendGenerationState();
+    desktopBridge?.scheduleSync(40);
 }
 
 function registerPipEventListeners() {
@@ -1507,6 +1804,9 @@ function registerPipEventListeners() {
 function init() {
     registerSettingsPanel();
     registerLauncher();
+    registerPipEventListeners();
+    initializeDesktopBridge();
+    installDesktopMutationObserver();
     startLauncherRetry();
 }
 

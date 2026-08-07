@@ -72,6 +72,10 @@
 }
 
 .pip-mini-chat-settings__section--compatibility {
+    margin-bottom: 10px;
+}
+
+.pip-mini-chat-settings__section--desktop {
     margin-bottom: 0;
 }
 
@@ -90,6 +94,53 @@
 
 .pip-mini-chat-settings__field select {
     width: min(210px, 58%);
+}
+
+.pip-mini-chat-settings__field--stacked {
+    flex-direction: column;
+    align-items: stretch;
+}
+
+.pip-mini-chat-settings__field--stacked input,
+.pip-mini-chat-settings__field--stacked textarea {
+    width: 100%;
+    max-width: none;
+}
+
+.pip-mini-chat-settings__field--stacked textarea {
+    min-height: 74px;
+    resize: vertical;
+}
+
+.pip-mini-chat-settings__desktop-status {
+    margin: 8px 0 12px;
+    color: var(--SmartThemeQuoteColor, rgba(255, 255, 255, 0.72));
+}
+
+#pip-mini-chat-desktop-status[data-state="connected"] {
+    color: #4ade80;
+}
+
+#pip-mini-chat-desktop-status[data-state="connecting"],
+#pip-mini-chat-desktop-status[data-state="waiting"] {
+    color: #facc15;
+}
+
+#pip-mini-chat-desktop-status[data-state="error"],
+#pip-mini-chat-desktop-status[data-state="needs-config"] {
+    color: #fb7185;
+}
+
+.pip-mini-chat-settings__desktop-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin: 8px 0;
+}
+
+.pip-mini-chat-settings__desktop-actions .menu_button {
+    width: 100%;
+    margin: 0;
 }
 
 .pip-mini-chat-settings__field input[type="color"] {
