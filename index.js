@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.6.0';
+const EXTENSION_VERSION = '1.6.2';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const LAUNCHER_RETRY_LIMIT = 20;
@@ -753,8 +753,31 @@ function getDesktopInteractionElementId(source) {
     return sourceElementId;
 }
 
+function getDesktopElementChildPath(source) {
+    const body = source?.ownerDocument?.body;
+    if (!body || source === body) {
+        return '';
+    }
+
+    const parts = [];
+    let current = source;
+    while (current && current !== body) {
+        const parent = current.parentElement;
+        if (!parent) {
+            return '';
+        }
+        parts.unshift(String([...parent.children].indexOf(current)));
+        current = parent;
+    }
+    return current === body ? parts.join('.') : '';
+}
+
 function annotateClonedInteractionPaths(sourceRoot, cloneRoot) {
-    const pending = [{ source: sourceRoot, clone: cloneRoot, path: '' }];
+    const pending = [{
+        source: sourceRoot,
+        clone: cloneRoot,
+        path: getDesktopElementChildPath(sourceRoot),
+    }];
 
     while (pending.length) {
         const { source, clone, path } = pending.pop();
@@ -995,7 +1018,13 @@ function flushDesktopPatchOperations() {
 
     const operations = [...desktopPendingPatchOperations.values()].filter(operation => {
         const source = desktopInteractionTargets.get(operation.nodeId);
-        return !source || source.isConnected;
+        if (source && !source.isConnected) {
+            return false;
+        }
+
+        return !source || !replacements.some(entry => (
+            entry.target !== source && entry.target.contains?.(source)
+        ));
     });
     desktopPendingPatchOperations.clear();
     if (!operations.length) {
@@ -1524,6 +1553,76 @@ function findDesktopInteractionTarget(payload = {}) {
     return null;
 }
 
+function dispatchDesktopPointerActivation(target, payload = {}) {
+    const view = target.ownerDocument?.defaultView ?? window;
+    const rect = target.getBoundingClientRect?.() ?? {
+        left: 0,
+        top: 0,
+        width: 0,
+        height: 0,
+    };
+    const xRatio = clampNumber(payload.pointer?.xRatio, 0, 1, 0.5);
+    const yRatio = clampNumber(payload.pointer?.yRatio, 0, 1, 0.5);
+    const button = clampNumber(payload.pointer?.button, 0, 2, 0);
+    const common = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view,
+        button,
+        clientX: rect.left + (rect.width * xRatio),
+        clientY: rect.top + (rect.height * yRatio),
+        ctrlKey: Boolean(payload.pointer?.ctrlKey),
+        shiftKey: Boolean(payload.pointer?.shiftKey),
+        altKey: Boolean(payload.pointer?.altKey),
+        metaKey: Boolean(payload.pointer?.metaKey),
+    };
+    const PointerEventConstructor = view.PointerEvent;
+    const MouseEventConstructor = view.MouseEvent ?? MouseEvent;
+    const dispatchPointer = (type, buttons) => {
+        if (typeof PointerEventConstructor !== 'function') {
+            return;
+        }
+        target.dispatchEvent(new PointerEventConstructor(type, {
+            ...common,
+            buttons,
+            pointerId: 1,
+            pointerType: 'mouse',
+            isPrimary: true,
+        }));
+    };
+    const dispatchMouse = (type, buttons, detail = 0) => {
+        target.dispatchEvent(new MouseEventConstructor(type, {
+            ...common,
+            buttons,
+            detail,
+        }));
+    };
+
+    dispatchPointer('pointerdown', 1);
+    if (!target.isConnected) {
+        return;
+    }
+    dispatchMouse('mousedown', 1, 1);
+    if (!target.isConnected) {
+        return;
+    }
+    try {
+        target.focus?.({ preventScroll: true });
+    } catch {
+        target.focus?.();
+    }
+    dispatchPointer('pointerup', 0);
+    if (!target.isConnected) {
+        return;
+    }
+    dispatchMouse('mouseup', 0, 1);
+    if (!target.isConnected) {
+        return;
+    }
+    dispatchMouse('click', 0, 1);
+}
+
 async function handleDesktopInteraction(payload = {}) {
     const optionDisplayText = String(payload.optionDisplayText ?? '').trim().slice(0, 20_000);
     const target = findDesktopInteractionTarget(payload);
@@ -1534,16 +1633,7 @@ async function handleDesktopInteraction(payload = {}) {
             desktopComposerSyncTimer = null;
             suppressDesktopComposerSyncUntil = Date.now() + 400;
         }
-        if (typeof target.click === 'function') {
-            target.click();
-        } else {
-            const EventConstructor = target.ownerDocument?.defaultView?.MouseEvent ?? MouseEvent;
-            target.dispatchEvent(new EventConstructor('click', {
-                bubbles: true,
-                cancelable: true,
-                composed: true,
-            }));
-        }
+        dispatchDesktopPointerActivation(target, payload);
 
         if (optionDisplayText) {
             applyDesktopComposerText(optionDisplayText);
@@ -1588,26 +1678,47 @@ function dispatchFrontendControlEvent(target, type) {
 }
 
 function handleDesktopInputInteraction(payload = {}) {
-    const target = findDesktopInteractionTarget(payload);
-    if (!target) {
+    const actionId = String(payload.actionId ?? '').slice(0, 120);
+    const sourceElementId = String(payload.sourceElementId ?? '').slice(0, 120);
+    const createResult = (handled, target = null) => {
+        let value = String(payload.value ?? '').slice(0, 200_000);
+        let checked = Boolean(payload.checked);
+        if (handled && target) {
+            if (target.matches?.('input[type="checkbox"], input[type="radio"]')) {
+                value = String(target.value ?? '');
+                checked = Boolean(target.checked);
+            } else if (target.matches?.('input, textarea, select')) {
+                value = String(target.value ?? '');
+            } else if (target.isContentEditable || target.hasAttribute?.('contenteditable')) {
+                value = String(target.textContent ?? '');
+            }
+        }
         return {
-            handled: false,
+            handled,
             composerText: null,
             skipGenerationState: true,
             skipRenderSync: true,
+            inputAck: {
+                actionId,
+                sourceElementId: handled
+                    ? (getDesktopInteractionElementId(target) || sourceElementId)
+                    : sourceElementId,
+                handled,
+                value,
+                checked,
+            },
         };
+    };
+    const target = findDesktopInteractionTarget(payload);
+    if (!target) {
+        return createResult(false);
     }
 
     const value = String(payload.value ?? '').slice(0, 200_000);
     if (target.tagName === 'INPUT') {
         const inputType = String(target.type || '').toLowerCase();
         if (inputType === 'file' || inputType === 'password') {
-            return {
-                handled: false,
-                composerText: null,
-                skipGenerationState: true,
-                skipRenderSync: true,
-            };
+            return createResult(false);
         }
         if (inputType === 'checkbox' || inputType === 'radio') {
             setNativeControlProperty(target, 'checked', Boolean(payload.checked));
@@ -1619,12 +1730,7 @@ function handleDesktopInputInteraction(payload = {}) {
     } else if (target.isContentEditable || target.hasAttribute?.('contenteditable')) {
         target.textContent = value;
     } else {
-        return {
-            handled: false,
-            composerText: null,
-            skipGenerationState: true,
-            skipRenderSync: true,
-        };
+        return createResult(false);
     }
 
     dispatchFrontendControlEvent(target, 'input');
@@ -1632,12 +1738,7 @@ function handleDesktopInputInteraction(payload = {}) {
         dispatchFrontendControlEvent(target, 'change');
     }
 
-    return {
-        handled: true,
-        composerText: null,
-        skipGenerationState: true,
-        skipRenderSync: true,
-    };
+    return createResult(true, target);
 }
 
 function getSillyTavernComposerText() {

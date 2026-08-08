@@ -424,6 +424,9 @@ export class DesktopBridge {
                     text: result.composerText,
                 });
             }
+            if (result?.inputAck) {
+                this.send('interaction:input-ack', result.inputAck);
+            }
             if (!result?.skipGenerationState) {
                 this.sendGenerationState();
             }
