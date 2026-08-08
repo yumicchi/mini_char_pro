@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.5.0';
+const EXTENSION_VERSION = '1.5.2';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const LAUNCHER_RETRY_LIMIT = 20;
@@ -72,6 +72,10 @@ let desktopComposerSyncTimer = null;
 let desktopComposerInputListenerInstalled = false;
 let applyingDesktopComposerUpdate = false;
 let lastDesktopComposerText = '';
+let suppressDesktopComposerSyncUntil = 0;
+let desktopInteractionFrameCounter = 0;
+let desktopInteractionElementCounter = 0;
+let desktopInteractionTargets = new Map();
 let compatibleSendMode = readBooleanSetting({
     storage: globalThis.localStorage,
     key: COMPATIBLE_SEND_MODE_KEY,
@@ -695,45 +699,31 @@ function absolutizeClonedResources(sourceRoot, cloneRoot) {
     }
 }
 
-function getElementChildPath(element, root) {
-    if (element === root) {
-        return '';
+function isExplicitOptionElement(element) {
+    if (element.matches?.('[data-option], [data-pip-input], .option-item')) {
+        return true;
     }
 
-    const indices = [];
-    let current = element;
-    while (current && current !== root) {
-        const parent = current.parentElement;
-        if (!parent) {
-            return null;
-        }
-
-        const index = Array.prototype.indexOf.call(parent.children, current);
-        if (index < 0) {
-            return null;
-        }
-        indices.push(index);
-        current = parent;
-    }
-
-    return current === root ? indices.reverse().join('.') : null;
+    const classTokens = String(element.className || '').split(/\s+/).filter(Boolean);
+    return classTokens.some(token => (
+        /^(?:[a-z0-9]+[-_])?(?:option|choice|decision)(?:[-_](?:item|card|button|entry|row))?$/i
+            .test(token)
+    ));
 }
 
 function annotateClonedInteractionPaths(sourceRoot, cloneRoot) {
-    const sourceElements = [sourceRoot, ...(sourceRoot.querySelectorAll?.('*') ?? [])];
-    const cloneElements = [cloneRoot, ...(cloneRoot.querySelectorAll?.('*') ?? [])];
+    const pending = [{ source: sourceRoot, clone: cloneRoot, path: '' }];
 
-    for (let index = 0; index < sourceElements.length; index += 1) {
-        const source = sourceElements[index];
-        const clone = cloneElements[index];
+    while (pending.length) {
+        const { source, clone, path } = pending.pop();
         if (!clone || ['SCRIPT', 'STYLE', 'LINK', 'META', 'BASE'].includes(source.tagName)) {
             continue;
         }
 
-        const path = getElementChildPath(source, sourceRoot);
-        if (path !== null) {
-            clone.setAttribute('data-pip-source-path', path);
-        }
+        clone.setAttribute('data-pip-source-path', path);
+        const sourceElementId = `e${++desktopInteractionElementCounter}`;
+        clone.setAttribute('data-pip-source-element-id', sourceElementId);
+        desktopInteractionTargets.set(sourceElementId, source);
         if (source.matches?.(
             '[data-veil-action], [data-pip-input], [data-option], .option-item, '
             + '[role="button"], [onclick], [tabindex], button, a, '
@@ -742,15 +732,21 @@ function annotateClonedInteractionPaths(sourceRoot, cloneRoot) {
         )) {
             clone.setAttribute('data-pip-source-interactive', 'true');
         }
-        const sourceText = String(source.textContent || '').replace(/\s+/g, ' ').trim();
-        if (
-            source.matches?.(
-                '[data-option], [data-pip-input], .option-item, '
-                + '[class*="option" i], [class*="choice" i], [class*="decision" i]',
-            )
-            || /^[A-E]\s*.{3,}$/i.test(sourceText)
-        ) {
+        if (isExplicitOptionElement(source)) {
             clone.setAttribute('data-pip-source-option', 'true');
+        }
+
+        const sourceChildren = source.children ?? [];
+        const cloneChildren = clone.children ?? [];
+        for (let index = sourceChildren.length - 1; index >= 0; index -= 1) {
+            if (!cloneChildren[index]) {
+                continue;
+            }
+            pending.push({
+                source: sourceChildren[index],
+                clone: cloneChildren[index],
+                path: path ? `${path}.${index}` : String(index),
+            });
         }
     }
 }
@@ -810,6 +806,21 @@ function frameDocumentHasRenderableContent(frameDocument) {
     return false;
 }
 
+function getDesktopInteractionFrameId(frame) {
+    const existing = String(frame?.dataset?.pipDesktopFrameId || '').trim();
+    if (existing) {
+        return existing;
+    }
+
+    const generated = `pip-desktop-frame-${++desktopInteractionFrameCounter}`;
+    try {
+        frame.dataset.pipDesktopFrameId = generated;
+        return generated;
+    } catch {
+        return String(frame?.id || frame?.name || generated);
+    }
+}
+
 function serializeFrameDocument(frame, diagnostics = null) {
     const frameDocument = getAccessibleFrameDocument(frame);
     if (!frameDocument || !frameDocumentHasRenderableContent(frameDocument)) {
@@ -819,7 +830,7 @@ function serializeFrameDocument(frame, diagnostics = null) {
     const wrapper = document.createElement('section');
     wrapper.className = 'pip-mini-chat-embedded-document';
     wrapper.dataset.pipEmbeddedDocument = 'true';
-    wrapper.dataset.pipSourceFrameId = String(frame.id || frame.name || '');
+    wrapper.dataset.pipSourceFrameId = getDesktopInteractionFrameId(frame);
     copyFrameRootAppearance(frameDocument, wrapper);
 
     for (const source of frameDocument.head?.querySelectorAll?.(
@@ -1016,6 +1027,8 @@ function findRenderedMessageElement(messageIndex, chatLength) {
 }
 
 function getDesktopRenderPayload() {
+    desktopInteractionTargets = new Map();
+    desktopInteractionElementCounter = 0;
     syncGenerationState();
     const context = getContext();
     const latest = findLatestAssistantMessage(context?.chat);
@@ -1116,6 +1129,11 @@ function resolveElementChildPath(root, value) {
 }
 
 function findDesktopInteractionTarget(payload = {}) {
+    const directTarget = desktopInteractionTargets.get(String(payload.sourceElementId || ''));
+    if (directTarget?.isConnected) {
+        return directTarget;
+    }
+
     const context = getContext();
     const latest = findLatestAssistantMessage(context?.chat);
     if (!latest) {
@@ -1127,16 +1145,15 @@ function findDesktopInteractionTarget(payload = {}) {
     if (!root) {
         return null;
     }
-
-    const roots = collectRenderedInteractionRoots(root);
+    const frameSearchRoot = messageElement || root;
 
     if (
         payload.sourceFrameId
         && typeof payload.sourcePath === 'string'
     ) {
         const expectedFrameId = String(payload.sourceFrameId);
-        for (const entry of collectAccessibleInteractionFrames(root)) {
-            if (String(entry.frame.id || entry.frame.name || '') !== expectedFrameId) {
+        for (const entry of collectAccessibleInteractionFrames(frameSearchRoot)) {
+            if (getDesktopInteractionFrameId(entry.frame) !== expectedFrameId) {
                 continue;
             }
 
@@ -1146,6 +1163,8 @@ function findDesktopInteractionTarget(payload = {}) {
             }
         }
     }
+
+    const roots = collectRenderedInteractionRoots(root);
 
     if (payload.id) {
         for (const interactionRoot of roots) {
@@ -1192,23 +1211,15 @@ function findDesktopInteractionTarget(payload = {}) {
     return null;
 }
 
-async function waitForComposerTextChange(previousValue, timeout = 300) {
-    const deadline = Date.now() + timeout;
-    let currentValue = String(document.querySelector('#send_textarea')?.value ?? '');
-
-    while (currentValue === previousValue && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 25));
-        currentValue = String(document.querySelector('#send_textarea')?.value ?? '');
-    }
-
-    return currentValue;
-}
-
 async function handleDesktopInteraction(payload = {}) {
-    const textareaBeforeClick = document.querySelector('#send_textarea');
-    const previousComposerText = String(textareaBeforeClick?.value ?? '');
+    const optionDisplayText = String(payload.optionDisplayText ?? '').trim().slice(0, 20_000);
     const target = findDesktopInteractionTarget(payload);
     if (target) {
+        if (optionDisplayText) {
+            clearTimeout(desktopComposerSyncTimer);
+            desktopComposerSyncTimer = null;
+            suppressDesktopComposerSyncUntil = Date.now() + 400;
+        }
         if (typeof target.click === 'function') {
             target.click();
         } else {
@@ -1220,23 +1231,20 @@ async function handleDesktopInteraction(payload = {}) {
             }));
         }
 
-        const composerText = await waitForComposerTextChange(previousComposerText);
+        if (optionDisplayText) {
+            applyDesktopComposerText(optionDisplayText);
+            return {
+                handled: true,
+                composerText: optionDisplayText,
+            };
+        }
         return {
             handled: true,
-            composerText: composerText !== previousComposerText ? composerText : null,
+            composerText: null,
         };
     }
 
-    const text = String(payload.text ?? '').trim();
-    const textarea = document.querySelector('#send_textarea');
-    if (!text || !textarea) {
-        return { handled: false, composerText: null };
-    }
-
-    textarea.value = String(textarea.value ?? '') + text;
-    textarea.dispatchEvent(new Event('input', { bubbles: true }));
-    textarea.focus();
-    return { handled: true, composerText: textarea.value };
+    return { handled: false, composerText: null };
 }
 
 function getSillyTavernComposerText() {
@@ -1293,6 +1301,7 @@ function installDesktopComposerSync() {
     document.addEventListener('input', event => {
         if (
             applyingDesktopComposerUpdate
+            || Date.now() < suppressDesktopComposerSyncUntil
             || !event.target?.matches?.('#send_textarea')
         ) {
             return;
