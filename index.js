@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.6.2';
+const EXTENSION_VERSION = '1.6.3';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const LAUNCHER_RETRY_LIMIT = 20;
@@ -676,6 +676,28 @@ const RENDERED_BLOCK_SELECTOR = [
     'iframe',
 ].join(', ');
 
+const DESKTOP_MIRROR_INTERACTION_SELECTOR = [
+    'input',
+    'textarea',
+    'select',
+    '[contenteditable]:not([contenteditable="false"])',
+    '[data-veil-action]',
+    '[data-pip-input]',
+    '[data-option]',
+    '.option-item',
+    '[role="button"]',
+    '[onclick]',
+    '[tabindex]',
+    'button',
+    'a',
+    '[class*="option" i]',
+    '[class*="choice" i]',
+    '[class*="action" i]',
+    '[class*="decision" i]',
+    '[class*="select" i]',
+    '[class*="card" i]',
+].join(', ');
+
 function getAccessibleFrameDocument(frame) {
     try {
         const doc = frame?.contentDocument ?? frame?.contentWindow?.document;
@@ -772,7 +794,7 @@ function getDesktopElementChildPath(source) {
     return current === body ? parts.join('.') : '';
 }
 
-function annotateClonedInteractionPaths(sourceRoot, cloneRoot) {
+function annotateClonedInteractionPaths(sourceRoot, cloneRoot, interactiveOnly = false) {
     const pending = [{
         source: sourceRoot,
         clone: cloneRoot,
@@ -785,16 +807,14 @@ function annotateClonedInteractionPaths(sourceRoot, cloneRoot) {
             continue;
         }
 
-        clone.setAttribute('data-pip-source-path', path);
-        const sourceElementId = getDesktopInteractionElementId(source);
-        clone.setAttribute('data-pip-source-element-id', sourceElementId);
-        if (source.matches?.(
-            '[data-veil-action], [data-pip-input], [data-option], .option-item, '
-            + '[role="button"], [onclick], [tabindex], button, a, '
-            + '[class*="option" i], [class*="choice" i], [class*="action" i], '
-            + '[class*="decision" i], [class*="select" i], [class*="card" i]',
-        )) {
-            clone.setAttribute('data-pip-source-interactive', 'true');
+        const isInteractive = Boolean(source.matches?.(DESKTOP_MIRROR_INTERACTION_SELECTOR));
+        if (!interactiveOnly || isInteractive) {
+            clone.setAttribute('data-pip-source-path', path);
+            const sourceElementId = getDesktopInteractionElementId(source);
+            clone.setAttribute('data-pip-source-element-id', sourceElementId);
+            if (isInteractive) {
+                clone.setAttribute('data-pip-source-interactive', 'true');
+            }
         }
         if (isExplicitOptionElement(source)) {
             clone.setAttribute('data-pip-source-option', 'true');
@@ -930,7 +950,11 @@ function cloneRenderedNode(sourceNode, diagnostics = null, annotateInteractions 
     const clone = sourceNode.cloneNode(true);
     absolutizeClonedResources(sourceNode, clone);
     if (annotateInteractions) {
-        annotateClonedInteractionPaths(sourceNode, clone);
+        annotateClonedInteractionPaths(
+            sourceNode,
+            clone,
+            annotateInteractions === 'interactive',
+        );
     }
     const sourceFrames = [...(sourceNode.querySelectorAll?.('iframe') ?? [])];
     const cloneFrames = [...(clone.querySelectorAll?.('iframe') ?? [])];
@@ -1224,7 +1248,7 @@ function sanitizeRenderedMessageSnapshot(textElement, messageElement = textEleme
     const sourceCandidates = textElement.querySelectorAll?.('p, pre, code, textarea') ?? [];
     const containsFrontendSource = [...sourceCandidates]
         .some(element => looksLikeRawHtmlSource(element.textContent ?? ''));
-    const clone = cloneRenderedNode(textElement, diagnostics);
+    const clone = cloneRenderedNode(textElement, diagnostics, 'interactive');
 
     for (const renderedBlock of getExtraRenderedBlocks(messageElement, textElement)) {
         let renderedClone;
@@ -1235,7 +1259,7 @@ function sanitizeRenderedMessageSnapshot(textElement, messageElement = textEleme
             }
             renderedClone = serializeFrameDocument(renderedBlock, diagnostics);
         } else {
-            renderedClone = cloneRenderedNode(renderedBlock, diagnostics);
+            renderedClone = cloneRenderedNode(renderedBlock, diagnostics, 'interactive');
         }
         if (renderedClone) {
             clone.append(renderedClone);
