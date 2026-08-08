@@ -10,6 +10,8 @@ const DESKTOP_ACTION_TYPES = new Set([
     'generation:retry',
     'generation:stop',
     'interaction:select',
+    'interaction:input',
+    'render:resync',
 ]);
 
 export const MAX_DESKTOP_MESSAGE_BYTES = 14 * 1024 * 1024;
@@ -137,6 +139,8 @@ function encodeBridgeMessage(
     encoded = JSON.stringify({
         type,
         payload: {
+            documentId: String(payload?.documentId || '').slice(0, 200),
+            revision: Number.isSafeInteger(payload?.revision) ? payload.revision : 0,
             title: String(payload?.title || 'SillyTavern').slice(0, 200),
             html: '',
             text: String(payload?.text || '渲染界面过大，已切换为原始文字。').slice(0, 200_000),
@@ -420,8 +424,12 @@ export class DesktopBridge {
                     text: result.composerText,
                 });
             }
-            this.sendGenerationState();
-            this.scheduleSync(30);
+            if (!result?.skipGenerationState) {
+                this.sendGenerationState();
+            }
+            if (!result?.skipRenderSync) {
+                this.scheduleSync(30);
+            }
         } catch (error) {
             this.logger.error?.('[pip-mini-chat] Desktop action failed', error);
         }

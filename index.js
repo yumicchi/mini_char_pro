@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.5.2';
+const EXTENSION_VERSION = '1.6.0';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const LAUNCHER_RETRY_LIMIT = 20;
@@ -75,7 +75,18 @@ let lastDesktopComposerText = '';
 let suppressDesktopComposerSyncUntil = 0;
 let desktopInteractionFrameCounter = 0;
 let desktopInteractionElementCounter = 0;
+let desktopInteractionElementIds = new WeakMap();
 let desktopInteractionTargets = new Map();
+let desktopMirrorDocumentCounter = 0;
+let desktopMirrorDocumentId = '';
+let desktopMirrorKey = '';
+let desktopMirrorRevision = 0;
+let desktopChatCollectionCounter = 0;
+let desktopChatCollectionIds = new WeakMap();
+let desktopPatchTimer = null;
+let desktopPendingPatchOperations = new Map();
+let desktopPendingFrameReplacements = new Map();
+const desktopFrameObservers = new Map();
 let compatibleSendMode = readBooleanSetting({
     storage: globalThis.localStorage,
     key: COMPATIBLE_SEND_MODE_KEY,
@@ -696,6 +707,23 @@ function absolutizeClonedResources(sourceRoot, cloneRoot) {
                 clone.setAttribute(property, absolute);
             }
         }
+
+        if (source.tagName === 'INPUT') {
+            const inputType = String(source.type || '').toLowerCase();
+            if (inputType === 'checkbox' || inputType === 'radio') {
+                clone.checked = Boolean(source.checked);
+                clone.toggleAttribute('checked', Boolean(source.checked));
+            } else if (inputType !== 'file') {
+                clone.value = String(source.value ?? '');
+                clone.setAttribute('value', String(source.value ?? ''));
+            }
+        } else if (source.tagName === 'TEXTAREA') {
+            clone.value = String(source.value ?? '');
+            clone.textContent = String(source.value ?? '');
+        } else if (source.tagName === 'OPTION') {
+            clone.selected = Boolean(source.selected);
+            clone.toggleAttribute('selected', Boolean(source.selected));
+        }
     }
 }
 
@@ -711,6 +739,20 @@ function isExplicitOptionElement(element) {
     ));
 }
 
+function getDesktopInteractionElementId(source) {
+    if (source?.nodeType !== 1) {
+        return '';
+    }
+
+    let sourceElementId = desktopInteractionElementIds.get(source);
+    if (!sourceElementId) {
+        sourceElementId = `e${++desktopInteractionElementCounter}`;
+        desktopInteractionElementIds.set(source, sourceElementId);
+    }
+    desktopInteractionTargets.set(sourceElementId, source);
+    return sourceElementId;
+}
+
 function annotateClonedInteractionPaths(sourceRoot, cloneRoot) {
     const pending = [{ source: sourceRoot, clone: cloneRoot, path: '' }];
 
@@ -721,9 +763,8 @@ function annotateClonedInteractionPaths(sourceRoot, cloneRoot) {
         }
 
         clone.setAttribute('data-pip-source-path', path);
-        const sourceElementId = `e${++desktopInteractionElementCounter}`;
+        const sourceElementId = getDesktopInteractionElementId(source);
         clone.setAttribute('data-pip-source-element-id', sourceElementId);
-        desktopInteractionTargets.set(sourceElementId, source);
         if (source.matches?.(
             '[data-veil-action], [data-pip-input], [data-option], .option-item, '
             + '[role="button"], [onclick], [tabindex], button, a, '
@@ -828,9 +869,14 @@ function serializeFrameDocument(frame, diagnostics = null) {
     }
 
     const wrapper = document.createElement('section');
-    wrapper.className = 'pip-mini-chat-embedded-document';
+    wrapper.className = [
+        'pip-mini-chat-embedded-document',
+        String(frameDocument.body.className || '').trim(),
+    ].filter(Boolean).join(' ');
     wrapper.dataset.pipEmbeddedDocument = 'true';
-    wrapper.dataset.pipSourceFrameId = getDesktopInteractionFrameId(frame);
+    const frameId = getDesktopInteractionFrameId(frame);
+    wrapper.dataset.pipSourceFrameId = frameId;
+    wrapper.dataset.pipSourceElementId = getDesktopInteractionElementId(frameDocument.body);
     copyFrameRootAppearance(frameDocument, wrapper);
 
     for (const source of frameDocument.head?.querySelectorAll?.(
@@ -847,6 +893,8 @@ function serializeFrameDocument(frame, diagnostics = null) {
     while (bodyClone.firstChild) {
         wrapper.append(bodyClone.firstChild);
     }
+
+    ensureDesktopFrameObserver(frame, frameDocument, frameId);
 
     if (diagnostics) {
         diagnostics.serializedFrameCount += 1;
@@ -879,6 +927,232 @@ function cloneRenderedNode(sourceNode, diagnostics = null, annotateInteractions 
     }
 
     return clone;
+}
+
+function disconnectDesktopFrameObservers() {
+    for (const [frame, entry] of desktopFrameObservers) {
+        entry.observer?.disconnect();
+        entry.document?.removeEventListener?.('input', entry.inputListener, true);
+        entry.document?.removeEventListener?.('change', entry.inputListener, true);
+        frame.removeEventListener?.('load', entry.loadListener);
+    }
+    desktopFrameObservers.clear();
+}
+
+function queueDesktopPatchOperation(operation) {
+    if (!desktopMirrorDocumentId || !operation?.type) {
+        return;
+    }
+
+    const key = operation.type === 'attribute'
+        ? `${operation.type}:${operation.nodeId}:${operation.name}`
+        : `${operation.type}:${operation.nodeId || operation.frameId || ''}`;
+    desktopPendingPatchOperations.set(key, operation);
+    scheduleDesktopPatchFlush();
+}
+
+function scheduleDesktopPatchFlush() {
+    if (desktopPatchTimer) {
+        return;
+    }
+
+    desktopPatchTimer = window.setTimeout(flushDesktopPatchOperations, 16);
+}
+
+function flushDesktopPatchOperations() {
+    clearTimeout(desktopPatchTimer);
+    desktopPatchTimer = null;
+    if (!desktopPendingPatchOperations.size && !desktopPendingFrameReplacements.size) {
+        return;
+    }
+
+    const replacements = [...desktopPendingFrameReplacements.values()].filter(entry => (
+        ![...desktopPendingFrameReplacements.values()].some(other => (
+            other !== entry && other.target.contains?.(entry.target)
+        ))
+    ));
+    desktopPendingFrameReplacements.clear();
+    try {
+        for (const entry of replacements) {
+            if (!entry.target.isConnected) {
+                continue;
+            }
+            const type = entry.target === entry.frameDocument.body
+                ? 'frame-body'
+                : 'replace-children';
+            desktopPendingPatchOperations.set(`${type}:${entry.nodeId}`, {
+                type,
+                nodeId: entry.nodeId,
+                frameId: entry.frameId,
+                html: serializeDesktopElementChildren(entry.target),
+            });
+        }
+    } catch {
+        desktopPendingPatchOperations.clear();
+        desktopBridge?.sync(true);
+        return;
+    }
+
+    const operations = [...desktopPendingPatchOperations.values()].filter(operation => {
+        const source = desktopInteractionTargets.get(operation.nodeId);
+        return !source || source.isConnected;
+    });
+    desktopPendingPatchOperations.clear();
+    if (!operations.length) {
+        return;
+    }
+    const baseRevision = desktopMirrorRevision;
+    const payload = {
+        documentId: desktopMirrorDocumentId,
+        baseRevision,
+        revision: baseRevision + 1,
+        operations,
+    };
+    const serializedLength = JSON.stringify(payload).length;
+    if (operations.length > 300 || serializedLength > 2_000_000) {
+        desktopBridge?.sync(true);
+        return;
+    }
+
+    if (desktopBridge?.send('render:patch', payload)) {
+        desktopMirrorRevision = payload.revision;
+    } else {
+        desktopBridge?.scheduleSync(0);
+    }
+}
+
+function serializeDesktopElementChildren(target) {
+    const clone = cloneRenderedNode(target, null, true);
+    return clone.innerHTML;
+}
+
+function queueDesktopFrameReplacement(frameDocument, frameId, target) {
+    const replacementTarget = target?.nodeType === 1 ? target : target?.parentElement;
+    if (!replacementTarget?.isConnected) {
+        return;
+    }
+
+    const nodeId = getDesktopInteractionElementId(replacementTarget);
+    if (!nodeId) {
+        return;
+    }
+    desktopPendingFrameReplacements.set(nodeId, {
+        frameDocument,
+        frameId,
+        nodeId,
+        target: replacementTarget,
+    });
+    scheduleDesktopPatchFlush();
+}
+
+function queueDesktopFrameMutation(frameDocument, frameId, mutation) {
+    if (mutation.type === 'attributes' && mutation.target?.nodeType === 1) {
+        const name = String(mutation.attributeName || '').toLowerCase();
+        if (
+            !name
+            || name === 'data-pip-desktop-frame-id'
+            || name === 'data-pip-embedded-document'
+            || name.startsWith('data-pip-source-')
+            || name.startsWith('on')
+            || name === 'srcdoc'
+            || name === 'nonce'
+        ) {
+            return;
+        }
+        const nodeId = getDesktopInteractionElementId(mutation.target);
+        if (!nodeId) {
+            return;
+        }
+        queueDesktopPatchOperation({
+            type: 'attribute',
+            nodeId,
+            name,
+            value: mutation.target.hasAttribute(name)
+                ? String(mutation.target.getAttribute(name))
+                : null,
+        });
+        return;
+    }
+
+    if (mutation.type === 'characterData') {
+        queueDesktopFrameReplacement(frameDocument, frameId, mutation.target?.parentElement);
+        return;
+    }
+
+    if (mutation.type === 'childList') {
+        queueDesktopFrameReplacement(frameDocument, frameId, mutation.target);
+    }
+}
+
+function queueDesktopControlValue(target) {
+    if (target?.nodeType !== 1 || !target.isConnected) {
+        return;
+    }
+    const nodeId = getDesktopInteractionElementId(target);
+    if (!nodeId) {
+        return;
+    }
+
+    const operation = {
+        type: 'value',
+        nodeId,
+        value: '',
+        checked: false,
+    };
+    if (target.matches?.('input[type="checkbox"], input[type="radio"]')) {
+        operation.value = String(target.value ?? '');
+        operation.checked = Boolean(target.checked);
+    } else if (target.matches?.('input, textarea, select')) {
+        operation.value = String(target.value ?? '');
+    } else if (target.isContentEditable || target.hasAttribute?.('contenteditable')) {
+        operation.value = String(target.textContent ?? '');
+    } else {
+        return;
+    }
+    queueDesktopPatchOperation(operation);
+}
+
+function ensureDesktopFrameObserver(frame, frameDocument, frameId) {
+    const existing = desktopFrameObservers.get(frame);
+    if (existing?.document === frameDocument) {
+        return;
+    }
+    if (existing) {
+        existing.observer?.disconnect();
+        existing.document?.removeEventListener?.('input', existing.inputListener, true);
+        existing.document?.removeEventListener?.('change', existing.inputListener, true);
+        frame.removeEventListener?.('load', existing.loadListener);
+    }
+
+    const Observer = frameDocument.defaultView?.MutationObserver ?? MutationObserver;
+    const observer = new Observer(mutations => {
+        for (const mutation of mutations) {
+            queueDesktopFrameMutation(frameDocument, frameId, mutation);
+        }
+    });
+    observer.observe(frameDocument.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+    });
+
+    const inputListener = event => queueDesktopControlValue(event.target);
+    frameDocument.addEventListener('input', inputListener, true);
+    frameDocument.addEventListener('change', inputListener, true);
+    const loadListener = () => {
+        const entry = desktopFrameObservers.get(frame);
+        entry?.observer?.disconnect();
+        desktopFrameObservers.delete(frame);
+        desktopBridge?.scheduleSync(20);
+    };
+    frame.addEventListener('load', loadListener);
+    desktopFrameObservers.set(frame, {
+        document: frameDocument,
+        observer,
+        inputListener,
+        loadListener,
+    });
 }
 
 function getExtraRenderedBlocks(messageElement, textElement) {
@@ -1026,12 +1300,49 @@ function findRenderedMessageElement(messageIndex, chatLength) {
     return visibleMessages[messageIndex] ?? null;
 }
 
-function getDesktopRenderPayload() {
+function getDesktopChatCollectionId(chat) {
+    if (!chat || (typeof chat !== 'object' && typeof chat !== 'function')) {
+        return 'none';
+    }
+    let id = desktopChatCollectionIds.get(chat);
+    if (!id) {
+        id = `chat-${++desktopChatCollectionCounter}`;
+        desktopChatCollectionIds.set(chat, id);
+    }
+    return id;
+}
+
+function ensureDesktopMirrorIdentity(context, latest) {
+    const nextKey = JSON.stringify({
+        chatCollection: getDesktopChatCollectionId(context?.chat),
+        characterId: context?.characterId ?? null,
+        groupId: context?.groupId ?? null,
+        chatId: context?.chatId ?? context?.chat_id ?? null,
+        latestIndex: latest?.index ?? -1,
+    });
+    if (nextKey === desktopMirrorKey && desktopMirrorDocumentId) {
+        return;
+    }
+
+    desktopMirrorKey = nextKey;
+    desktopMirrorDocumentId = `mirror-${Date.now()}-${++desktopMirrorDocumentCounter}`;
+    desktopMirrorRevision = 0;
+    clearTimeout(desktopPatchTimer);
+    desktopPatchTimer = null;
+    desktopPendingPatchOperations.clear();
+    desktopPendingFrameReplacements.clear();
+    disconnectDesktopFrameObservers();
     desktopInteractionTargets = new Map();
+    desktopInteractionElementIds = new WeakMap();
     desktopInteractionElementCounter = 0;
+}
+
+function getDesktopRenderPayload() {
     syncGenerationState();
     const context = getContext();
     const latest = findLatestAssistantMessage(context?.chat);
+    ensureDesktopMirrorIdentity(context, latest);
+    desktopInteractionTargets = new Map();
     const rawText = String(latest?.message?.mes ?? '');
     const renderedSnapshot = getRenderedLatestAssistantSnapshot(context);
     let html = renderedSnapshot?.html || formatLatestAssistantMessage({
@@ -1050,6 +1361,8 @@ function getDesktopRenderPayload() {
     }
 
     return {
+        documentId: desktopMirrorDocumentId,
+        revision: desktopMirrorRevision,
         title: getTitle(context),
         html,
         text,
@@ -1215,6 +1528,7 @@ async function handleDesktopInteraction(payload = {}) {
     const optionDisplayText = String(payload.optionDisplayText ?? '').trim().slice(0, 20_000);
     const target = findDesktopInteractionTarget(payload);
     if (target) {
+        const isMirroredFrameTarget = target.ownerDocument !== document;
         if (optionDisplayText) {
             clearTimeout(desktopComposerSyncTimer);
             desktopComposerSyncTimer = null;
@@ -1236,15 +1550,94 @@ async function handleDesktopInteraction(payload = {}) {
             return {
                 handled: true,
                 composerText: optionDisplayText,
+                skipRenderSync: isMirroredFrameTarget,
             };
         }
         return {
             handled: true,
             composerText: null,
+            skipRenderSync: isMirroredFrameTarget,
         };
     }
 
     return { handled: false, composerText: null };
+}
+
+function setNativeControlProperty(target, property, value) {
+    const view = target.ownerDocument?.defaultView ?? window;
+    const prototypes = {
+        INPUT: view.HTMLInputElement?.prototype,
+        TEXTAREA: view.HTMLTextAreaElement?.prototype,
+        SELECT: view.HTMLSelectElement?.prototype,
+    };
+    const descriptor = Object.getOwnPropertyDescriptor(prototypes[target.tagName], property);
+    if (typeof descriptor?.set === 'function') {
+        descriptor.set.call(target, value);
+    } else {
+        target[property] = value;
+    }
+}
+
+function dispatchFrontendControlEvent(target, type) {
+    const EventConstructor = target.ownerDocument?.defaultView?.Event ?? Event;
+    target.dispatchEvent(new EventConstructor(type, {
+        bubbles: true,
+        cancelable: false,
+        composed: true,
+    }));
+}
+
+function handleDesktopInputInteraction(payload = {}) {
+    const target = findDesktopInteractionTarget(payload);
+    if (!target) {
+        return {
+            handled: false,
+            composerText: null,
+            skipGenerationState: true,
+            skipRenderSync: true,
+        };
+    }
+
+    const value = String(payload.value ?? '').slice(0, 200_000);
+    if (target.tagName === 'INPUT') {
+        const inputType = String(target.type || '').toLowerCase();
+        if (inputType === 'file' || inputType === 'password') {
+            return {
+                handled: false,
+                composerText: null,
+                skipGenerationState: true,
+                skipRenderSync: true,
+            };
+        }
+        if (inputType === 'checkbox' || inputType === 'radio') {
+            setNativeControlProperty(target, 'checked', Boolean(payload.checked));
+        } else {
+            setNativeControlProperty(target, 'value', value);
+        }
+    } else if (target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') {
+        setNativeControlProperty(target, 'value', value);
+    } else if (target.isContentEditable || target.hasAttribute?.('contenteditable')) {
+        target.textContent = value;
+    } else {
+        return {
+            handled: false,
+            composerText: null,
+            skipGenerationState: true,
+            skipRenderSync: true,
+        };
+    }
+
+    dispatchFrontendControlEvent(target, 'input');
+    if (payload.commit) {
+        dispatchFrontendControlEvent(target, 'change');
+    }
+
+    return {
+        handled: true,
+        composerText: null,
+        skipGenerationState: true,
+        skipRenderSync: true,
+    };
 }
 
 function getSillyTavernComposerText() {
@@ -1311,6 +1704,13 @@ function installDesktopComposerSync() {
 }
 
 async function handleDesktopBridgeAction(message) {
+    if (message.type === 'render:resync') {
+        desktopBridge?.sync(true);
+        return {
+            skipGenerationState: true,
+            skipRenderSync: true,
+        };
+    }
     if (message.type === 'composer:update') {
         applyDesktopComposerText(message.payload?.text);
         return null;
@@ -1329,6 +1729,9 @@ async function handleDesktopBridgeAction(message) {
     }
     if (message.type === 'interaction:select') {
         return handleDesktopInteraction(message.payload);
+    }
+    if (message.type === 'interaction:input') {
+        return handleDesktopInputInteraction(message.payload);
     }
 
     return null;
@@ -1367,8 +1770,15 @@ function installDesktopMutationObserver() {
 
     desktopMutationObserver?.disconnect();
     desktopObservedChat = chat;
-    desktopMutationObserver = new MutationObserver(() => {
-        desktopBridge?.scheduleSync(120);
+    desktopMutationObserver = new MutationObserver(mutations => {
+        const requiresFullSync = mutations.some(mutation => !(
+            mutation.type === 'attributes'
+            && mutation.target?.matches?.('iframe')
+            && ['style', 'height', 'width'].includes(mutation.attributeName)
+        ));
+        if (requiresFullSync) {
+            desktopBridge?.scheduleSync(120);
+        }
     });
     desktopMutationObserver.observe(chat, {
         subtree: true,
@@ -1407,8 +1817,6 @@ function startDesktopSyncHeartbeat() {
         if (observerChanged || signature !== lastDesktopChatSignature) {
             lastDesktopChatSignature = signature;
             desktopBridge?.sync(true);
-        } else {
-            desktopBridge?.sync();
         }
     }, 1000);
 
