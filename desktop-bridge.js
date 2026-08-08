@@ -120,6 +120,30 @@ function getUtf8ByteLength(value) {
     return new Blob([value]).size;
 }
 
+function getTextOnlyConversationTurns(value, maximumTextLength = null) {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+
+    const normalizeParticipant = participant => {
+        if (!participant || typeof participant !== 'object') {
+            return null;
+        }
+        const text = String(participant.text ?? '');
+        return {
+            index: Number.isSafeInteger(participant.index) ? participant.index : 0,
+            name: String(participant.name ?? '').slice(0, 200),
+            text: maximumTextLength === null ? text : text.slice(0, maximumTextLength),
+        };
+    };
+
+    return value.slice(-8).map(turn => ({
+        id: String(turn?.id ?? '').slice(0, 120),
+        user: normalizeParticipant(turn?.user),
+        assistant: normalizeParticipant(turn?.assistant),
+    })).filter(turn => turn.id && (turn.user || turn.assistant));
+}
+
 function encodeBridgeMessage(
     type,
     payload,
@@ -136,6 +160,19 @@ function encodeBridgeMessage(
         return null;
     }
 
+    const textOnlyTurns = getTextOnlyConversationTurns(payload?.turns);
+    encoded = JSON.stringify({
+        type,
+        payload: {
+            ...payload,
+            turns: textOnlyTurns,
+        },
+    });
+    if (getUtf8ByteLength(encoded) <= maximumBytes) {
+        logger.warn?.('[pip-mini-chat] Historical rendered HTML was too large; complete turn text was sent instead.');
+        return encoded;
+    }
+
     encoded = JSON.stringify({
         type,
         payload: {
@@ -144,6 +181,7 @@ function encodeBridgeMessage(
             title: String(payload?.title || 'SillyTavern').slice(0, 200),
             html: '',
             text: String(payload?.text || '渲染界面过大，已切换为原始文字。').slice(0, 200_000),
+            turns: getTextOnlyConversationTurns(payload?.turns, 10_000),
             streaming: Boolean(payload?.streaming),
             themeVariables: {},
         },

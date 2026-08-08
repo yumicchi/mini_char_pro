@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.7.2';
+const EXTENSION_VERSION = '1.7.3';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const DESKTOP_HISTORY_MAX_TURNS = 8;
@@ -938,7 +938,7 @@ function serializeFrameDocument(frame, diagnostics = null, annotateInteractions 
     const bodyClone = cloneRenderedNode(
         frameDocument.body,
         diagnostics,
-        annotateInteractions ? 'interactive' : false,
+        annotateInteractions,
     );
     while (bodyClone.firstChild) {
         wrapper.append(bodyClone.firstChild);
