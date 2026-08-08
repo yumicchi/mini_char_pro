@@ -25,9 +25,10 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.6.3';
+const EXTENSION_VERSION = '1.7.1';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
+const DESKTOP_HISTORY_MAX_TURNS = 8;
 const LAUNCHER_RETRY_LIMIT = 20;
 const FLOATING_POSITION_KEY = 'pip-mini-chat-floating-position';
 const COMPATIBLE_SEND_MODE_KEY = 'pip-mini-chat-compatible-send-mode';
@@ -1230,7 +1231,15 @@ function getRenderedLatestAssistantSnapshot(context) {
         return null;
     }
 
-    const messageElement = findRenderedMessageElement(latest.index, context?.chat?.length);
+    return getRenderedMessageSnapshot(context, latest);
+}
+
+function getRenderedMessageSnapshot(context, entry) {
+    if (!entry || !Number.isSafeInteger(entry.index)) {
+        return null;
+    }
+
+    const messageElement = findRenderedMessageElement(entry.index, context?.chat?.length);
     const textElement = messageElement?.querySelector?.('.mes_text') ?? messageElement;
     if (!textElement) {
         return null;
@@ -1371,6 +1380,7 @@ function ensureDesktopMirrorIdentity(context, latest) {
         characterId: context?.characterId ?? null,
         groupId: context?.groupId ?? null,
         chatId: context?.chatId ?? context?.chat_id ?? null,
+        chatLength: Array.isArray(context?.chat) ? context.chat.length : 0,
         latestIndex: latest?.index ?? -1,
     });
     if (nextKey === desktopMirrorKey && desktopMirrorDocumentId) {
@@ -1390,19 +1400,84 @@ function ensureDesktopMirrorIdentity(context, latest) {
     desktopInteractionElementCounter = 0;
 }
 
+function getRecentDesktopConversationTurns(context, maximum = DESKTOP_HISTORY_MAX_TURNS) {
+    const chat = Array.isArray(context?.chat) ? context.chat : [];
+    const turns = [];
+    let currentTurn = null;
+
+    for (let index = 0; index < chat.length; index += 1) {
+        const message = chat[index];
+        if (!message || message.is_system === true) {
+            continue;
+        }
+
+        if (message.is_user === true) {
+            if (currentTurn) {
+                turns.push(currentTurn);
+            }
+            currentTurn = {
+                id: `turn-${getDesktopChatCollectionId(chat)}-${index}`,
+                user: { message, index },
+                assistants: [],
+            };
+            continue;
+        }
+
+        if (!currentTurn) {
+            currentTurn = {
+                id: `turn-${getDesktopChatCollectionId(chat)}-orphan-${index}`,
+                user: null,
+                assistants: [],
+            };
+        }
+        currentTurn.assistants.push({ message, index });
+    }
+
+    if (currentTurn) {
+        turns.push(currentTurn);
+    }
+
+    return turns.slice(-Math.max(1, maximum)).map(turn => {
+        const assistantText = turn.assistants
+            .map(entry => extractDesktopFallbackText(entry.message?.mes) || String(entry.message?.mes ?? ''))
+            .filter(Boolean)
+            .join('\n\n');
+        const latestAssistant = turn.assistants.at(-1) ?? null;
+        return {
+            id: turn.id,
+            user: turn.user
+                ? {
+                    index: turn.user.index,
+                    name: String(turn.user.message?.name ?? '你'),
+                    text: String(turn.user.message?.mes ?? ''),
+                }
+                : null,
+            assistant: latestAssistant
+                ? {
+                    index: latestAssistant.index,
+                    name: String(latestAssistant.message?.name ?? getTitle(context)),
+                    text: assistantText,
+                }
+                : null,
+            latestAssistant,
+        };
+    });
+}
+
 function getDesktopRenderPayload() {
     syncGenerationState();
     const context = getContext();
-    const latest = findLatestAssistantMessage(context?.chat);
+    const turns = getRecentDesktopConversationTurns(context);
+    const latestTurn = turns.at(-1) ?? null;
+    const latest = latestTurn?.latestAssistant
+        ?? (latestTurn?.user ? { index: latestTurn.user.index } : null);
     ensureDesktopMirrorIdentity(context, latest);
     desktopInteractionTargets = new Map();
-    const rawText = String(latest?.message?.mes ?? '');
-    const renderedSnapshot = getRenderedLatestAssistantSnapshot(context);
-    let html = renderedSnapshot?.html || formatLatestAssistantMessage({
-        chat: context?.chat,
-        formatter: context?.messageFormatting,
-    });
-    let text = extractDesktopFallbackText(rawText) || rawText;
+    const latestAssistant = latestTurn?.latestAssistant ?? null;
+    const rawText = String(latestAssistant?.message?.mes ?? '');
+    const renderedSnapshot = getRenderedMessageSnapshot(context, latestAssistant);
+    let html = renderedSnapshot?.html || '';
+    let text = latestTurn?.assistant?.text || extractDesktopFallbackText(rawText) || rawText;
 
     if (
         renderedSnapshot?.containsFrontendSource
@@ -1419,6 +1494,7 @@ function getDesktopRenderPayload() {
         title: getTitle(context),
         html,
         text,
+        turns: turns.map(({ latestAssistant: _latestAssistant, ...turn }) => turn),
         streaming: isGenerating,
         themeVariables: collectThemeVariables(getComputedStyle(document.documentElement)),
     };
@@ -1426,6 +1502,30 @@ function getDesktopRenderPayload() {
 
 function normalizeInteractionText(value) {
     return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeDesktopComposerMode(value) {
+    const mode = String(value ?? '').trim().toLowerCase();
+    return ['replace', 'overwrite', 'set'].includes(mode) ? 'replace' : 'append';
+}
+
+function mergeDesktopComposerText(currentValue, optionText, mode = 'append') {
+    const current = String(currentValue ?? '');
+    const option = String(optionText ?? '').trim();
+    if (!option || normalizeDesktopComposerMode(mode) === 'replace') {
+        return option;
+    }
+    if (!current) {
+        return option;
+    }
+
+    const separator = /\s$/.test(current) ? '' : '\n';
+    return `${current}${separator}${option}`;
+}
+
+async function waitForDesktopInteractionEffects() {
+    await Promise.resolve();
+    await new Promise(resolve => window.setTimeout(resolve, 0));
 }
 
 function collectRenderedInteractionRoots(root) {
@@ -1652,18 +1752,40 @@ async function handleDesktopInteraction(payload = {}) {
     const target = findDesktopInteractionTarget(payload);
     if (target) {
         const isMirroredFrameTarget = target.ownerDocument !== document;
-        if (optionDisplayText) {
-            clearTimeout(desktopComposerSyncTimer);
-            desktopComposerSyncTimer = null;
-            suppressDesktopComposerSyncUntil = Date.now() + 400;
+        let composerBefore = getSillyTavernComposerText();
+        if (optionDisplayText && typeof payload.composerBaseText === 'string') {
+            const desktopComposerText = payload.composerBaseText.slice(0, 20_000);
+            if (desktopComposerText !== composerBefore) {
+                applyDesktopComposerText(desktopComposerText);
+                composerBefore = desktopComposerText;
+            }
         }
         dispatchDesktopPointerActivation(target, payload);
 
         if (optionDisplayText) {
-            applyDesktopComposerText(optionDisplayText);
+            await waitForDesktopInteractionEffects();
+            clearTimeout(desktopComposerSyncTimer);
+            desktopComposerSyncTimer = null;
+
+            const composerAfter = getSillyTavernComposerText();
+            if (composerAfter !== composerBefore) {
+                lastDesktopComposerText = composerAfter;
+                return {
+                    handled: true,
+                    composerText: composerAfter,
+                    skipRenderSync: isMirroredFrameTarget,
+                };
+            }
+
+            const fallbackText = mergeDesktopComposerText(
+                composerBefore,
+                optionDisplayText,
+                payload.composerMode,
+            );
+            applyDesktopComposerText(fallbackText);
             return {
                 handled: true,
-                composerText: optionDisplayText,
+                composerText: fallbackText,
                 skipRenderSync: isMirroredFrameTarget,
             };
         }
@@ -1943,6 +2065,11 @@ function startDesktopSyncHeartbeat() {
             lastDesktopChatSignature = signature;
             desktopBridge?.sync(true);
         }
+
+        // Generation cleanup happens after the final message DOM mutation in
+        // some SillyTavern/extension combinations. Keep this state heartbeat
+        // independent from message changes so the companion always unlocks.
+        desktopBridge?.sendGenerationState();
     }, 1000);
 
     document.addEventListener('visibilitychange', () => {
@@ -2896,6 +3023,11 @@ function init() {
     registerLauncher();
     registerPipEventListeners();
     initializeDesktopBridge();
+    void loadSillyTavernStatusHelpers().then(() => {
+        syncGenerationState();
+        desktopBridge?.sendGenerationState();
+        desktopBridge?.scheduleSync(0);
+    });
     installDesktopComposerSync();
     installDesktopMutationObserver();
     startDesktopSyncHeartbeat();
