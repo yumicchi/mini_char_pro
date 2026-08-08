@@ -25,7 +25,7 @@ import {
 } from './desktop-bridge.js';
 
 const EXTENSION_NAME = 'pip-mini-chat';
-const EXTENSION_VERSION = '1.7.1';
+const EXTENSION_VERSION = '1.7.2';
 const PIP_WIDTH = 380;
 const PIP_HEIGHT = 360;
 const DESKTOP_HISTORY_MAX_TURNS = 8;
@@ -906,7 +906,7 @@ function getDesktopInteractionFrameId(frame) {
     }
 }
 
-function serializeFrameDocument(frame, diagnostics = null) {
+function serializeFrameDocument(frame, diagnostics = null, annotateInteractions = true) {
     const frameDocument = getAccessibleFrameDocument(frame);
     if (!frameDocument || !frameDocumentHasRenderableContent(frameDocument)) {
         return null;
@@ -918,9 +918,11 @@ function serializeFrameDocument(frame, diagnostics = null) {
         String(frameDocument.body.className || '').trim(),
     ].filter(Boolean).join(' ');
     wrapper.dataset.pipEmbeddedDocument = 'true';
-    const frameId = getDesktopInteractionFrameId(frame);
-    wrapper.dataset.pipSourceFrameId = frameId;
-    wrapper.dataset.pipSourceElementId = getDesktopInteractionElementId(frameDocument.body);
+    const frameId = annotateInteractions ? getDesktopInteractionFrameId(frame) : '';
+    if (annotateInteractions) {
+        wrapper.dataset.pipSourceFrameId = frameId;
+        wrapper.dataset.pipSourceElementId = getDesktopInteractionElementId(frameDocument.body);
+    }
     copyFrameRootAppearance(frameDocument, wrapper);
 
     for (const source of frameDocument.head?.querySelectorAll?.(
@@ -933,12 +935,18 @@ function serializeFrameDocument(frame, diagnostics = null) {
         wrapper.append(clone);
     }
 
-    const bodyClone = cloneRenderedNode(frameDocument.body, diagnostics, true);
+    const bodyClone = cloneRenderedNode(
+        frameDocument.body,
+        diagnostics,
+        annotateInteractions ? 'interactive' : false,
+    );
     while (bodyClone.firstChild) {
         wrapper.append(bodyClone.firstChild);
     }
 
-    ensureDesktopFrameObserver(frame, frameDocument, frameId);
+    if (annotateInteractions) {
+        ensureDesktopFrameObserver(frame, frameDocument, frameId);
+    }
 
     if (diagnostics) {
         diagnostics.serializedFrameCount += 1;
@@ -968,7 +976,11 @@ function cloneRenderedNode(sourceNode, diagnostics = null, annotateInteractions 
             }
         }
 
-        const serialized = serializeFrameDocument(sourceFrames[index], diagnostics);
+        const serialized = serializeFrameDocument(
+            sourceFrames[index],
+            diagnostics,
+            Boolean(annotateInteractions),
+        );
         if (serialized && cloneFrames[index]) {
             cloneFrames[index].replaceWith(serialized);
         }
@@ -1234,7 +1246,7 @@ function getRenderedLatestAssistantSnapshot(context) {
     return getRenderedMessageSnapshot(context, latest);
 }
 
-function getRenderedMessageSnapshot(context, entry) {
+function getRenderedMessageSnapshot(context, entry, annotateInteractions = true) {
     if (!entry || !Number.isSafeInteger(entry.index)) {
         return null;
     }
@@ -1245,10 +1257,14 @@ function getRenderedMessageSnapshot(context, entry) {
         return null;
     }
 
-    return sanitizeRenderedMessageSnapshot(textElement, messageElement);
+    return sanitizeRenderedMessageSnapshot(textElement, messageElement, annotateInteractions);
 }
 
-function sanitizeRenderedMessageSnapshot(textElement, messageElement = textElement) {
+function sanitizeRenderedMessageSnapshot(
+    textElement,
+    messageElement = textElement,
+    annotateInteractions = true,
+) {
     const diagnostics = {
         frameCount: 0,
         frontendFrameCount: 0,
@@ -1257,7 +1273,11 @@ function sanitizeRenderedMessageSnapshot(textElement, messageElement = textEleme
     const sourceCandidates = textElement.querySelectorAll?.('p, pre, code, textarea') ?? [];
     const containsFrontendSource = [...sourceCandidates]
         .some(element => looksLikeRawHtmlSource(element.textContent ?? ''));
-    const clone = cloneRenderedNode(textElement, diagnostics, 'interactive');
+    const clone = cloneRenderedNode(
+        textElement,
+        diagnostics,
+        annotateInteractions ? 'interactive' : false,
+    );
 
     for (const renderedBlock of getExtraRenderedBlocks(messageElement, textElement)) {
         let renderedClone;
@@ -1266,9 +1286,17 @@ function sanitizeRenderedMessageSnapshot(textElement, messageElement = textEleme
             if (renderedBlock.closest?.('.TH-render')) {
                 diagnostics.frontendFrameCount += 1;
             }
-            renderedClone = serializeFrameDocument(renderedBlock, diagnostics);
+            renderedClone = serializeFrameDocument(
+                renderedBlock,
+                diagnostics,
+                annotateInteractions,
+            );
         } else {
-            renderedClone = cloneRenderedNode(renderedBlock, diagnostics, 'interactive');
+            renderedClone = cloneRenderedNode(
+                renderedBlock,
+                diagnostics,
+                annotateInteractions ? 'interactive' : false,
+            );
         }
         if (renderedClone) {
             clone.append(renderedClone);
@@ -1315,17 +1343,14 @@ function looksLikeRawHtmlSource(text) {
 }
 
 function extractDesktopFallbackText(rawMessage) {
-    const value = String(rawMessage ?? '');
-    const optionBlocks = [...value.matchAll(/<w2g(?:\s[^>]*)?>([\s\S]*?)<\/w2g\s*>/gi)]
-        .map(match => match[1].trim())
-        .filter(Boolean);
-    if (optionBlocks.length) {
-        return optionBlocks.join('\n\n');
-    }
-
-    return value
+    return String(rawMessage ?? '')
         .replace(/<update(?:\s[^>]*)?>[\s\S]*?<\/update\s*>/gi, '')
         .replace(/```(?:html?)?\s*[\s\S]*?<(?:html|body|script)\b[\s\S]*?```/gi, '')
+        .replace(/<html\b[^>]*>[\s\S]*?<\/html\s*>/gi, '')
+        .replace(/<body\b[^>]*>[\s\S]*?<\/body\s*>/gi, '')
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, '')
+        .replace(/<\/?w2g(?:\s[^>]*)?>/gi, '')
         .trim();
 }
 
@@ -1437,12 +1462,26 @@ function getRecentDesktopConversationTurns(context, maximum = DESKTOP_HISTORY_MA
         turns.push(currentTurn);
     }
 
-    return turns.slice(-Math.max(1, maximum)).map(turn => {
+    const recentTurns = turns.slice(-Math.max(1, maximum));
+    return recentTurns.map((turn, turnIndex) => {
         const assistantText = turn.assistants
             .map(entry => extractDesktopFallbackText(entry.message?.mes) || String(entry.message?.mes ?? ''))
             .filter(Boolean)
             .join('\n\n');
         const latestAssistant = turn.assistants.at(-1) ?? null;
+        const isLatestTurn = turnIndex === recentTurns.length - 1;
+        const assistantHtml = isLatestTurn
+            ? ''
+            : turn.assistants.map(entry => {
+                const snapshot = getRenderedMessageSnapshot(context, entry, false);
+                if (
+                    !snapshot?.html
+                    || (snapshot.containsFrontendSource && snapshot.serializedFrameCount === 0)
+                ) {
+                    return '';
+                }
+                return snapshot.html;
+            }).filter(Boolean).join('\n');
         return {
             id: turn.id,
             user: turn.user
@@ -1457,6 +1496,7 @@ function getRecentDesktopConversationTurns(context, maximum = DESKTOP_HISTORY_MA
                     index: latestAssistant.index,
                     name: String(latestAssistant.message?.name ?? getTitle(context)),
                     text: assistantText,
+                    html: assistantHtml,
                 }
                 : null,
             latestAssistant,
